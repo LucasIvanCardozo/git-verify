@@ -22,7 +22,7 @@ DO_FETCH=0
 ONLY_PENDING=0
 SHOW_DETAILED=0
 EXCLUDE_NOISE=1
-FETCH_PARALLEL=4  # Fetch paralelo: default 4, máximo 16. 1 = serial (--no-parallel).
+FETCH_PARALLEL=10 # Fetch paralelo: default 10, máximo 16. 1 = serial (--no-parallel).
 DO_PULL=0
 PULL_FF_ONLY=1    # Default seguro: solo fast-forward. Override con --rebase o --no-ff-only.
 PULL_REBASE=0
@@ -204,7 +204,7 @@ Opciones:
                       requiere autenticación, falla limpio (no queda
                       colgado pidiendo user/pass).
       --parallel N    Cantidad de fetches simultáneos con --fetch.
-                      Default 4, máximo 16. Más no ayuda (la red se
+                      Default 10, máximo 16. Más no ayuda (la red se
                       satura). En modo paralelo el progress muestra
                       solo el contador global, no el item actual.
       --no-parallel   Desactiva el paralelismo de --fetch (forza serial).

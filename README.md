@@ -81,7 +81,7 @@ git-verify                              # escanea $HOME entero, sin límite, sin
 git-verify --only-pending               # oculta los repos "clean"
 git-verify --fetch                      # hace 'git fetch' antes (necesario para "needs pull" preciso)
                                                # con 4 fetches en paralelo por default
-git-verify --fetch --parallel 8         # 8 fetches simultáneos (max 16)
+git-verify --fetch --parallel 8         # 8 fetches simultáneos (max 16, default 10)
 git-verify --fetch --no-parallel        # forzar serial (un fetch por vez)
 git-verify --pull                       # después del render, deja elegir repos y hace git pull --ff-only
 git-verify --pull --rebase              # usa git pull --rebase en vez de --ff-only
@@ -99,7 +99,7 @@ git-verify --help                       # ayuda completa
 | `[DIRECTORIO]`     | `$HOME` | Raíz del escaneo. Solo se usa el primer posicional.                                            |
 | `-d N` / `--depth` | `0`     | Profundidad máxima. `0` = sin límite (default). Cuenta el dir de partida: `raíz/<x>/.git` = 2. |
 | `--fetch`          | off     | Hace `git fetch --quiet` antes. Toca cada remote.                                              |
-| `--parallel N`     | `4`     | Fetches simultáneos (solo con `--fetch`). Default 4, máximo 16. Más no ayuda (red saturada).   |
+| `--parallel N`     | `10`    | Fetches simultáneos (solo con `--fetch`). Default 10, máximo 16. Más no ayuda (red saturada).  |
 | `--no-parallel`    | off     | Desactiva paralelismo, fuerza serial con `--fetch`.                                            |
 | `--pull`           | off     | Después del render, deja elegir de los repos con `!` cuáles hacer `git pull`. Activa fetch.    |
 | `--rebase`         | off     | Con `--pull`: usa `git pull --rebase` en vez del default `--ff-only`. Reescribe historia.      |

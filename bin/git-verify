@@ -115,9 +115,9 @@ progress_end() {
   local summary="$1"
   if [[ "$PROGRESS_ENABLED" -eq 1 ]]; then
     printf '\r\033[K%*s\r\033[K' 120 ""
-    [[ -n "$summary" ]] && printf '%s\n' "$summary"
-  else
-    [[ -n "$summary" ]] && printf '%s\n' "$summary"
+  fi
+  if [[ -n "$summary" ]]; then
+    printf '%s\n' "$summary"
   fi
 }
 

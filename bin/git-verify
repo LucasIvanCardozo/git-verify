@@ -151,6 +151,35 @@ progress_end() {
   fi
 }
 
+# Spinner "busy" en background, para fases de duración desconocida
+# (find, esperas cortas sin total ni ETA). Se actualiza solo y se detiene
+# con spinner_stop.
+SPINNER_PID=""
+spinner_start() {
+  local label="$1"
+  [[ "$PROGRESS_ENABLED" -eq 1 ]] || return 0
+  (
+    while :; do
+      local ch="${SPIN_CHARS:SPIN_IDX:1}"
+      SPIN_IDX=$(( (SPIN_IDX + 1) % ${#SPIN_CHARS} ))
+      printf '\r\033[K%s %s' "$ch" "$label"
+      sleep 0.15
+    done
+  ) &
+  SPINNER_PID=$!
+}
+
+spinner_stop() {
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=""
+  fi
+  if [[ "$PROGRESS_ENABLED" -eq 1 ]]; then
+    printf '\r\033[K'  # limpiar línea
+  fi
+}
+
 usage() {
   cat <<'EOF'
 git-verify - Lista repos git, separando los de GitHub del resto
@@ -468,90 +497,20 @@ if [[ "$EXCLUDE_NOISE" -eq 1 ]]; then
   PRUNE_ARGS+=(')' '-prune' '-o')
 fi
 
+progress_init
+spinner_start "scanning repositories under $SCAN_DIR..."
 mapfile -t ALL_REPOS < <(
   find "$SCAN_DIR" "${PRUNE_ARGS[@]}" "${FIND_ARGS[@]}" -name .git -type d -prune -print 2>/dev/null \
     | sed 's|/\.git$||' | sort -u
 )
+spinner_stop
 
 if [[ "${#ALL_REPOS[@]}" -eq 0 ]]; then
   echo "No se encontraron repositorios git en '$SCAN_DIR' (depth=$DEPTH)."
   exit 0
 fi
 
-# -------- Optional fetch (con tolerancia) --------
-declare -a FETCH_FAILURES=()
-if [[ "$DO_FETCH" -eq 1 ]]; then
-  fetch_total=${#ALL_REPOS[@]}
-  # Cap de paralelismo
-  if [[ "$FETCH_PARALLEL" -gt 16 ]]; then
-    FETCH_PARALLEL=16
-  fi
-  progress_init
-  i=0
-
-  # Modo serial: progress con nombre del item, sin paralelismo.
-  if [[ "$FETCH_PARALLEL" -le 1 ]]; then
-    for repo in "${ALL_REPOS[@]}"; do
-      i=$((i + 1))
-      progress "$i" "$fetch_total" "fetching" "$(basename "$repo")"
-      if ! git -C "$repo" fetch --quiet 2>/dev/null; then
-        FETCH_FAILURES+=("$repo")
-      fi
-    done
-  else
-    # Modo paralelo: cada repo se lanza en background. Las fallas se
-    # escriben a un archivo temporal (así no hay interleaving en
-    # stdout) y se recolectan al final. El progress muestra solo el
-    # contador global (no el item actual) porque varios procesos
-    # escribirían a la vez.
-    fetch_tmpdir=$(mktemp -d 2>/dev/null) || fetch_tmpdir="/tmp/gv-fetch-$$"
-    mkdir -p "$fetch_tmpdir"
-    in_flight=0
-    for repo in "${ALL_REPOS[@]}"; do
-      # Esperar si ya hay N en vuelo.
-      while [[ "$in_flight" -ge "$FETCH_PARALLEL" ]]; do
-        if wait -n 2>/dev/null; then :; fi  # Es bash 4.3+; toleramos fallos
-        in_flight=$((in_flight - 1))
-        i=$((i + 1))
-      done
-
-      # Encolar un fetch en background.
-      (
-        if ! git -C "$repo" fetch --quiet 2>/dev/null; then
-          # Fallo: lo dejamos como archivo en tmp para recolectar.
-          printf '%s\n' "$repo" > "$fetch_tmpdir/$(date +%s%N).$$.$BASHPID"
-        fi
-      ) &
-      in_flight=$((in_flight + 1))
-    done
-
-    # Esperar a que terminen todos los que quedan.
-    while [[ "$in_flight" -gt 0 ]]; do
-      if wait -n 2>/dev/null; then :; fi
-      in_flight=$((in_flight - 1))
-      i=$((i + 1))
-      # Actualizar progress sin nombre del item (porque varios corren).
-      [[ "$i" -le "$fetch_total" ]] && progress_p "$i" "$fetch_total" "fetching..."
-    done
-
-    # Asegurar progreso al 100% (por si quedó uno suelto).
-    [[ "$i" -lt "$fetch_total" ]] && progress_p "$fetch_total" "$fetch_total" "fetching..."
-
-    # Recolectar fallas desde los archivos temporales.
-    if [[ -d "$fetch_tmpdir" ]]; then
-      while IFS= read -r failfile; do
-        [[ -z "$failfile" ]] && continue
-        FETCH_FAILURES+=("$(cat "$failfile" 2>/dev/null)")
-      done < <(find "$fetch_tmpdir" -type f 2>/dev/null)
-      rm -rf "$fetch_tmpdir" 2>/dev/null
-    fi
-  fi
-
-  # Limpia la línea de progreso.
-  progress_end ""
-fi
-
-# -------- Categorizar + gather --------
+# -------- Categorizar + gather (local, da feedback inmediato) --------
 declare -a GH_DIRTY=()
 declare -a GH_CLEAN=()
 declare -a OTHER_DIRTY=()
@@ -595,6 +554,107 @@ for repo in "${ALL_REPOS[@]}"; do
   fi
 done
 progress_end ""  # limpia la línea de progreso (el clear va a barrer igual)
+
+# -------- Optional fetch (con tolerancia) --------
+# Va DESPUES del gather: gather es local (rapido, da feedback inmediato),
+# fetch es de red (lento). Asi el usuario ve progreso desde segundo 1.
+declare -a FETCH_FAILURES=()
+if [[ "$DO_FETCH" -eq 1 ]]; then
+  fetch_total=${#ALL_REPOS[@]}
+  # Cap de paralelismo
+  if [[ "$FETCH_PARALLEL" -gt 16 ]]; then
+    FETCH_PARALLEL=16
+  fi
+  # Si solo hay 1 repo, no tiene sentido paralelizar.
+  [[ "$fetch_total" -le 1 ]] && FETCH_PARALLEL=1
+
+  if [[ "$FETCH_PARALLEL" -le 1 ]]; then
+    # Serial: progress con nombre del item.
+    progress_init
+    i=0
+    for repo in "${ALL_REPOS[@]}"; do
+      i=$((i + 1))
+      progress "$i" "$fetch_total" "fetching" "$(basename "$repo")"
+      if ! git -C "$repo" fetch --quiet 2>/dev/null; then
+        FETCH_FAILURES+=("$repo")
+      fi
+    done
+    progress_end ""
+  else
+    # Paralelo: lanzamiento los primeros N jobs YA, mostrar feedback
+    # inmediato '[N/M] arrancando' antes del primer wait -n.
+    fetch_tmpdir=$(mktemp -d 2>/dev/null) || fetch_tmpdir="/tmp/gv-fetch-$$"
+    mkdir -p "$fetch_tmpdir"
+
+    progress_init
+    i=0
+
+    # Fase 1: lanzar los primeros N jobs sin esperar.
+    # Limitar el batch al total de repos disponibles.
+    initial_batch=$FETCH_PARALLEL
+    [[ "$initial_batch" -gt "$fetch_total" ]] && initial_batch="$fetch_total"
+
+    for ((idx=0; idx<initial_batch; idx++)); do
+      repo="${ALL_REPOS[$idx]}"
+      (
+        if ! git -C "$repo" fetch --quiet 2>/dev/null; then
+          printf '%s\n' "$repo" > "$fetch_tmpdir/$(date +%s%N).$$.$BASHPID"
+        fi
+      ) &
+    done
+    i=$initial_batch
+    progress_p "$i" "$fetch_total" "fetching..."
+
+    # Fase 2: lanzar el resto mientras esperamos que se libere slot.
+    for ((idx=initial_batch; idx<fetch_total; idx++)); do
+      repo="${ALL_REPOS[$idx]}"
+      # Esperar a que termine uno de los en vuelo.
+      if wait -n 2>/dev/null; then :; fi  # bash 4.3+, toleramos fallos
+      i=$((i + 1))
+      progress_p "$i" "$fetch_total" "fetching..."
+
+      # Lanzar el siguiente.
+      (
+        if ! git -C "$repo" fetch --quiet 2>/dev/null; then
+          printf '%s\n' "$repo" > "$fetch_tmpdir/$(date +%s%N).$$.$BASHPID"
+        fi
+      ) &
+    done
+
+    # Fase 3: esperar a que terminen los que quedan en vuelo.
+    # Cuántos quedan: total en vuelo = initial_batch (todos los que
+    # lanzamos menos los que ya terminaron en fase 2).
+    # Pero más simple: hacemos wait -n hasta que no haya más.
+    # Cada wait -n devuelve cuando UNO termina. Necesitamos esperar
+    # exactamente (initial_batch + (fetch_total - initial_batch)) - fetch_total
+    # = 0... no, necesitamos esperar a todos los en vuelo.
+    # Total lanzados = fetch_total. Terminados en fase 2 = (fetch_total - initial_batch).
+    # Restantes = fetch_total - (fetch_total - initial_batch) = initial_batch.
+    # PERO pueden haber terminado otros ya en fase 2 si fue muy rápido.
+    # Hacemos un while con contador.
+    launched=$fetch_total
+    finished=$((fetch_total - initial_batch))  # los que terminaron en fase 2
+    while [[ "$finished" -lt "$launched" ]]; do
+      if wait -n 2>/dev/null; then :; fi
+      finished=$((finished + 1))
+      i=$((i + 1))
+      [[ "$i" -le "$fetch_total" ]] && progress_p "$i" "$fetch_total" "fetching..."
+    done
+
+    # Asegurar progreso al 100%.
+    [[ "$i" -lt "$fetch_total" ]] && progress_p "$fetch_total" "$fetch_total" "fetching..."
+
+    # Recolectar fallas desde los archivos temporales.
+    if [[ -d "$fetch_tmpdir" ]]; then
+      while IFS= read -r failfile; do
+        [[ -z "$failfile" ]] && continue
+        FETCH_FAILURES+=("$(cat "$failfile" 2>/dev/null)")
+      done < <(find "$fetch_tmpdir" -type f 2>/dev/null)
+      rm -rf "$fetch_tmpdir" 2>/dev/null
+    fi
+    progress_end ""
+  fi
+fi
 
 # -------- Clear visual (solo TTY) --------
 [[ -t 1 ]] && clear

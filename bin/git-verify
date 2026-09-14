@@ -14,10 +14,24 @@ set -euo pipefail
 
 # -------- Defaults --------
 SCAN_DIR="$HOME"
-DEPTH=2
+DEPTH=0           # 0 = sin límite (escanea todo el árbol bajo SCAN_DIR)
 DO_FETCH=0
 ONLY_PENDING=0
 SHOW_DETAILED=0
+EXCLUDE_NOISE=1   # por default excluimos cache, trash y otros (ver NOISE_DIRS)
+
+# Paths que casi nunca son "proyectos tuyos" pero contienen .git dirs:
+#   - ~/.cache/paru/clone/  → clones temporales de AUR
+#   - ~/.local/share/Trash/ → papelera de Linux
+#   - ~/.nvm/               → versiones de Node (no son proyectos)
+#   - ~/.pi/agent/          → runtime de Pi
+# Con --include-all los incluís de vuelta.
+NOISE_DIRS=(
+  "*/.cache"
+  "*/.local/share/Trash"
+  "*/.nvm"
+  "*/.pi/agent"
+)
 
 # -------- Helpers --------
 usage() {
@@ -31,17 +45,23 @@ Argumentos:
   DIRECTORIO         Raíz a escanear. Default: $HOME
 
 Opciones:
-  -d, --depth N      Profundidad máxima (default: 2; 0 = sin límite).
+  -d, --depth N      Profundidad máxima (default: 0 = sin límite).
                      Cuenta el dir de partida: raiz/<x>/.git = 2.
+                     Con el default escaneamos el árbol completo.
       --fetch         Hace 'git fetch --quiet' antes de chequear. Toca
                       cada remote. Hace que "needs pull" sea preciso.
       --only-pending  Oculta los repos clean. Default: muestra todos.
       --detailed      Al final, llama a mgitstatus para info detallada de
                       los repos GitHub. Necesita mgitstatus instalado.
+      --include-all   No excluye las carpetas de "ruido" (cache, trash, nvm).
+                      Por default se filtran automáticamente.
   -h, --help         Esta ayuda.
 
 Dependencias:
   bash, git, find   (mgitstatus solo es obligatorio con --detailed)
+
+Carpetas de ruido excluidas por default:
+  ~/.cache, ~/.local/share/Trash, ~/.nvm, ~/.pi/agent
 EOF
 }
 
@@ -165,6 +185,7 @@ while [[ $# -gt 0 ]]; do
     --fetch)           DO_FETCH=1; shift ;;
     --only-pending)    ONLY_PENDING=1; shift ;;
     --detailed)        SHOW_DETAILED=1; shift ;;
+    --include-all)     EXCLUDE_NOISE=0; shift ;;
     --)                shift; while [[ $# -gt 0 ]]; do ARGS+=("$1"); shift; done ;;
     -*)                err "opción desconocida: $1"; usage; exit 2 ;;
     *)                 ARGS+=("$1"); shift ;;
@@ -200,8 +221,23 @@ else
   FIND_ARGS=(-maxdepth "$DEPTH")
 fi
 
+# Construir el filtro de paths excluidos (carpetas de ruido) si corresponde.
+PRUNE_ARGS=()
+if [[ "$EXCLUDE_NOISE" -eq 1 ]]; then
+  PRUNE_ARGS=(\()
+  i=0
+  for noise in "${NOISE_DIRS[@]}"; do
+    if [[ $i -gt 0 ]]; then
+      PRUNE_ARGS+=(-o)
+    fi
+    PRUNE_ARGS+=(-path "$noise")
+    i=$((i + 1))
+  done
+  PRUNE_ARGS+=(\) -prune -o)
+fi
+
 mapfile -t ALL_REPOS < <(
-  find "$SCAN_DIR" "${FIND_ARGS[@]}" -name .git -type d -prune -print 2>/dev/null \
+  find "$SCAN_DIR" "${PRUNE_ARGS[@]}" "${FIND_ARGS[@]}" -name .git -type d -prune -print 2>/dev/null \
     | sed 's|/\.git$||' | sort -u
 )
 

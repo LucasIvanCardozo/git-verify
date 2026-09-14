@@ -70,26 +70,26 @@ ln -s ~/code/git-verify/bin/git-verify ~/.local/bin/git-verify
 ## Uso
 
 ```bash
-git-verify                              # escanea $HOME, depth 2, sin fetch
+git-verify                              # escanea $HOME entero, sin límite, sin fetch
 git-verify --only-pending               # oculta los repos "clean"
 git-verify --fetch                      # hace 'git fetch' antes (necesario para "needs pull" preciso)
 git-verify --detailed                   # agrega sección detallada de los GH (usa mgitstatus)
 git-verify ~/proyectos                  # escanea otra raíz
-git-verify -d 4 ~/code                  # profundidad 4
-git-verify -d 0 ~/proyectos             # sin límite de profundidad
+git-verify -d 3 ~/code                  # limita a 3 niveles
 git-verify --help                       # ayuda completa
 ```
 
 ### Flags
 
-| Flag               | Default | Qué hace                                                                              |
-| ------------------ | ------- | ------------------------------------------------------------------------------------- |
-| `[DIRECTORIO]`     | `$HOME` | Raíz del escaneo. Solo se usa el primer posicional.                                   |
-| `-d N` / `--depth` | `2`     | Profundidad máxima. `0` = sin límite. Cuenta el dir de partida: `raíz/<x>/.git` = 2.  |
-| `--fetch`          | off     | Hace `git fetch --quiet` antes. Toca cada remote.                                     |
-| `--only-pending`   | off     | Oculta los repos clean (cambia el default de "mostrar todos" a "solo problemáticos"). |
-| `--detailed`       | off     | Al final, llama a `mgitstatus` para info detallada de los GH (necesita mgitstatus).   |
-| `-h` / `--help`    | —       | Ayuda.                                                                                |
+| Flag               | Default | Qué hace                                                                                       |
+| ------------------ | ------- | ---------------------------------------------------------------------------------------------- |
+| `[DIRECTORIO]`     | `$HOME` | Raíz del escaneo. Solo se usa el primer posicional.                                            |
+| `-d N` / `--depth` | `0`     | Profundidad máxima. `0` = sin límite (default). Cuenta el dir de partida: `raíz/<x>/.git` = 2. |
+| `--fetch`          | off     | Hace `git fetch --quiet` antes. Toca cada remote.                                              |
+| `--only-pending`   | off     | Oculta los repos clean (cambia el default de "mostrar todos" a "solo problemáticos").          |
+| `--detailed`       | off     | Al final, llama a `mgitstatus` para info detallada de los GH (necesita mgitstatus).            |
+| `--include-all`    | off     | No excluye las carpetas de "ruido" (ver abajo). Por default se filtran.                        |
+| `-h` / `--help`    | —       | Ayuda.                                                                                         |
 
 ### Qué significa cada ícono
 
@@ -110,6 +110,25 @@ te deja ver de un vistazo qué hay fuera de tu flujo principal de GitHub, sin
 perder visibilidad.
 
 Si te molesta verlos, pasale un directorio más específico en vez de `$HOME`.
+
+---
+
+## Carpetas excluidas por default
+
+Para que el output no se contamine con ruido que no son proyectos tuyos,
+por default se **excluyen** estas carpetas bajo la raíz del escaneo:
+
+| Path                   | Qué es                                         |
+| ---------------------- | ---------------------------------------------- |
+| `~/.cache`             | Caches de paquetes (paru/AUR, pip, npm, etc.)  |
+| `~/.local/share/Trash` | Papelera de Linux                              |
+| `~/.nvm`               | Versiones de Node instaladas (nvm)             |
+| `~/.pi/agent`          | Runtime de Pi (herramientas instaladas por Pi) |
+
+Para ver TODO (incluyendo esas carpetas), usá `--include-all`.
+
+Si querés agregar más exclusiones, abrí un issue o modificá la variable
+`NOISE_DIRS` al principio del script.
 
 ---
 
@@ -134,8 +153,9 @@ diverged, stash...), pero:
 
 ## Limitaciones conocidas
 
-- **Performance**: con `--depth 2` escanea `$HOME` entera. Suele tardar pocos
-  segundos. Con muchos miles de subdirs, bajale el `--depth`.
+- **Performance**: con el default (`--depth 0`) escanea `$HOME` entera. Suele
+  tardar pocos segundos. Con home con muchos miles de subdirs, bajale el
+  `--depth` o pasale un dir más chico.
 - **Submodules**: el script entra solo a `.git` directorios, así que no entra
   recursivamente en submodules. Suficiente para escaneo rápido; si necesitás
   info de submodules, andá directo con `git submodule status`.

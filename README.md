@@ -16,28 +16,35 @@ solo se necesita si usás `--detailed`.
 ## Ejemplo de salida
 
 ```text
-$ git-verify -d 2
+$ git-verify --fetch --only-pending
 
-git-verify — /home/lucas (depth=2)
-6 repos | 4 en GitHub | 2 en otros remotes
+git-verify  7 repos · 3 con cambios pendientes
+fetch activado · 4 jobs en paralelo
+filtro: solo pendientes
 
-GitHub (4)
-----------------------------------------
-  ✓ gentle-pi                                (main)  https://github.com/Gentleman-Programming/gentle-pi.git
-  ! mi-api                                   (develop)  https://github.com/user/mi-api.git
-       └─ unstaged:2 · untracked:1 · needs upstream
-  ✓ mi-cli                                   (main)  https://github.com/user/mi-cli.git
-  ✓ dotfiles                                 (main)  https://github.com/user/dotfiles.git
+▶ GitHub (7 repos · 3 con cambios)
+------------------------------------------------------------
+  ! carta-qr  1 behind
+  ! kioscoGustavo  44 behind
+  ! tuAmigoFI-viejo  34 unstaged · 8 untracked · 98 behind
 
-Otros remotes (2)
-----------------------------------------
-  ! cliente-internal                         (develop)  https://gitlab.com/user/cliente.git
-       └─ unstaged:1 · untracked:3
-  ✓ docs-old                                 (main)  (sin remote)
+▶ Otros remotes (0 repos · 0 con cambios)
+------------------------------------------------------------
+  (nada en esta categoría)
+
+fetch: 7 ok · 0 fallaron (sin auth o sin red)
 ```
 
-`✓` indica árbol de trabajo limpio, `!` indica cambios sin commitear, sin
-pushear o archivos sin trackear.
+Sin `--only-pending`, los repos clean también se listan (en su propio bloque
+`─ clean (N) ─`) y el remote tag se muestra solo en la sección **Otros remotes**
+(la sección GitHub lo omite para no ser redundante). El ícono y color solo
+aparecen si stdout es una terminal interactiva.
+
+`✓` indica árbol de trabajo limpio: sin staged/unstaged/untracked, sin commits
+locales sin pushear (ahead) y sin commits del remoto sin pullear (behind).
+`!` indica cualquier desviación: cambios locales sin commitear, archivos sin
+trackear, commits ahead (sin pushear), commits behind (sin pullear), o falta
+de upstream configurado.
 
 ---
 
@@ -108,11 +115,11 @@ Comportamiento automático:
 
 ### Qué significa cada ícono
 
-| Ícono | Significa                                                        |
-| ----- | ---------------------------------------------------------------- |
-| `✓`   | Working tree limpio (sin cambios sin commitear ni sin trackear). |
-| `!`   | Hay cambios: unstaged, staged, untracked, sin upstream, o dirty. |
-| `-`   | Repo bare (sin working dir).                                     |
+| Ícono | Significa                                                                                                            |
+| ----- | -------------------------------------------------------------------------------------------------------------------- |
+| `✓`   | Working tree limpio: sin cambios locales, sin commits ahead ni behind.                                               |
+| `!`   | Hay cambios: staged, unstaged, untracked, commits ahead (sin pushear), commits behind (sin pullear), o sin upstream. |
+| `-`   | Repo bare (sin working dir).                                                                                         |
 
 ---
 

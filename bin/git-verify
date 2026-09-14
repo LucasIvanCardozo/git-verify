@@ -234,7 +234,7 @@ is_github_repo() {
 
 gather_repo_info() {
   local repo="$1"
-  local branch="" remote_url="" staged=0 unstaged=0 untracked=0 upstream="" has_up=0 is_bare=0 is_clean=1
+  local branch="" remote_url="" staged=0 unstaged=0 untracked=0 upstream="" has_up=0 is_bare=0 is_clean=1 ahead=0 behind=0
 
   if [[ "$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null || echo false)" == "true" ]]; then
     is_bare=1
@@ -267,7 +267,29 @@ gather_repo_info() {
     upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
     [[ -n "$upstream" ]] && has_up=1
 
-    if [[ "$staged" -eq 0 && "$unstaged" -eq 0 && "$untracked" -eq 0 && "$has_up" -eq 1 ]]; then
+    # Ahead/behind vs upstream. Solo si hay upstream configurado y NO
+    # estamos en detached (en detached @{u} suele no estar definido o
+    # apunta a un commit arbitrario). Usa refs remotas cacheadas locales:
+    # si NO corriste --fetch, los números pueden estar stale — es honesto,
+    # es lo que git sabe sin hablar con el server.
+    #
+    # Con `'@{u}'...HEAD` el formato es "<solo-en-upstream>	<solo-en-HEAD>".
+    # El primer campo es lo que te falta pullear (behind), el segundo es
+    # lo que te falta pushear (ahead).
+    if [[ "$has_up" -eq 1 ]]; then
+      local counts
+      counts="$(git -C "$repo" rev-list --left-right --count '@{u}'...HEAD 2>/dev/null || echo "0	0")"
+      behind="${counts%%	*}"
+      ahead="${counts##*	}"
+      ahead="${ahead:-0}"
+      behind="${behind:-0}"
+      # Sanity: si algo raro pasó (no-numérico), caer a 0.
+      [[ "$ahead"  =~ ^[0-9]+$ ]] || ahead=0
+      [[ "$behind" =~ ^[0-9]+$ ]] || behind=0
+    fi
+
+    if [[ "$staged" -eq 0 && "$unstaged" -eq 0 && "$untracked" -eq 0 \
+       && "$ahead" -eq 0 && "$behind" -eq 0 && "$has_up" -eq 1 ]]; then
       is_clean=1
     else
       is_clean=0
@@ -277,7 +299,7 @@ gather_repo_info() {
     remote_url=""
   fi
 
-  printf '%s\n' "${repo}|${branch}|${remote_url}|${is_clean}|${staged}|${unstaged}|${untracked}|${has_up}|${is_bare}"
+  printf '%s\n' "${repo}|${branch}|${remote_url}|${is_clean}|${staged}|${unstaged}|${untracked}|${has_up}|${is_bare}|${ahead}|${behind}"
 }
 
 short_remote_tag() {
@@ -310,12 +332,14 @@ fmt_count() {
 #   $4 = branch, $5 = show_remote (0|1)
 print_repo_line() {
   local csv="$1" name="$2" colored_icon="$3" branch="$4" show_remote="$5"
-  IFS='|' read -r _ _ _ _ staged unstaged untracked has_up is_bare <<<"$csv"
+  IFS='|' read -r _ _ _ _ staged unstaged untracked has_up is_bare ahead behind <<<"$csv"
 
   local -a parts=()
   [[ "$staged"    -gt 0 ]] && parts+=("$(fmt_count "$staged" "staged")")
   [[ "$unstaged"  -gt 0 ]] && parts+=("$(fmt_count "$unstaged" "unstaged")")
   [[ "$untracked" -gt 0 ]] && parts+=("$(fmt_count "$untracked" "untracked")")
+  [[ "$ahead"     -gt 0 ]] && parts+=("$(fmt_count "$ahead" "ahead")")
+  [[ "$behind"    -gt 0 ]] && parts+=("$(fmt_count "$behind" "behind")")
   [[ "$has_up"    == "0" && "$is_bare" != "1" ]] && parts+=("needs upstream")
   local state=""
   if [[ "${#parts[@]}" -gt 0 ]]; then
@@ -333,7 +357,7 @@ print_repo_line() {
 
   if [[ "$show_remote" -eq 1 ]]; then
     local _url
-    IFS='|' read -r _ _ _remote _ _ _ _ _ _ <<<"$csv"
+    IFS='|' read -r _ _ _remote _ _ _ _ _ ahead behind <<<"$csv"
     local tag
     tag="$(short_remote_tag "$_remote")"
     printf '  %s %s  %s%s%s [%s]%s\n' \
@@ -393,7 +417,7 @@ render_section() {
     for csv in "${dirty_arr[@]}"; do
       local name branch
       name="$(basename "${csv%%|*}")"
-      IFS='|' read -r _ _ _ _ _ _ _ _ _ branch <<<"$csv"
+      IFS='|' read -r _ branch _ _ _ _ _ _ _ _ _ <<<"$csv"
       if [[ "$section_type" == "gh" ]]; then
         print_repo_line "$csv" "$name" "${C_RED}!${C_RESET}" "$branch" 0
       else
@@ -413,7 +437,7 @@ render_section() {
     for csv in "${clean_arr[@]}"; do
       local name branch is_bare
       name="$(basename "${csv%%|*}")"
-      IFS='|' read -r _ _ _ _ _ _ _ _ is_bare branch <<<"$csv"
+      IFS='|' read -r _ branch _ _ _ _ _ _ _ is_bare _ _ <<<"$csv"
       if [[ "$is_bare" == "1" ]]; then
         printf '  %s- %s  %s(bare)%s\n' "$C_DIM" "$name" "$C_DIM" "$C_RESET"
       elif [[ "$section_type" == "gh" ]]; then

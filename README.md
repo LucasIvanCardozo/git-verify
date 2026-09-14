@@ -73,6 +73,9 @@ ln -s ~/code/git-verify/bin/git-verify ~/.local/bin/git-verify
 git-verify                              # escanea $HOME entero, sin límite, sin fetch
 git-verify --only-pending               # oculta los repos "clean"
 git-verify --fetch                      # hace 'git fetch' antes (necesario para "needs pull" preciso)
+                                           # con 4 fetches en paralelo por default
+git-verify --fetch --parallel 8         # 8 fetches simultáneos (max 16)
+git-verify --fetch --no-parallel        # forzar serial (un fetch por vez)
 git-verify --detailed                   # agrega sección detallada de los GH (usa mgitstatus)
 git-verify ~/proyectos                  # escanea otra raíz
 git-verify -d 3 ~/code                  # limita a 3 niveles
@@ -86,6 +89,8 @@ git-verify --help                       # ayuda completa
 | `[DIRECTORIO]`     | `$HOME` | Raíz del escaneo. Solo se usa el primer posicional.                                            |
 | `-d N` / `--depth` | `0`     | Profundidad máxima. `0` = sin límite (default). Cuenta el dir de partida: `raíz/<x>/.git` = 2. |
 | `--fetch`          | off     | Hace `git fetch --quiet` antes. Toca cada remote.                                              |
+| `--parallel N`     | `4`     | Fetches simultáneos (solo con `--fetch`). Default 4, máximo 16. Más no ayuda (red saturada).   |
+| `--no-parallel`    | off     | Desactiva paralelismo, fuerza serial con `--fetch`.                                            |
 | `--only-pending`   | off     | Oculta los repos clean (cambia el default de "mostrar todos" a "solo problemáticos").          |
 | `--detailed`       | off     | Al final, llama a `mgitstatus` para info detallada de los GH (necesita mgitstatus).            |
 | `--include-all`    | off     | No excluye las carpetas de "ruido" (ver abajo). Por default se filtran.                        |

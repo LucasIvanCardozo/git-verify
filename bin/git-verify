@@ -32,6 +32,7 @@ PULL_REBASE=0
 # Paths que casi nunca son "proyectos tuyos" pero contienen .git dirs.
 NOISE_DIRS=(
   "*/.cache"
+  "*/.tmp"
   "*/.local/share/Trash"
   "*/.nvm"
   "*/.pi/agent"
@@ -228,7 +229,7 @@ Dependencias:
   bash, git, find   (mgitstatus solo es obligatorio con --detailed)
 
 Carpetas de ruido excluidas por default:
-  ~/.cache, ~/.local/share/Trash, ~/.nvm, ~/.pi/agent
+  ~/.cache, ~/.tmp, ~/.local/share/Trash, ~/.nvm, ~/.pi/agent
 EOF
 }
 

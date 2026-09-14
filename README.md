@@ -249,6 +249,7 @@ por default se **excluyen** estas carpetas bajo la raíz del escaneo:
 | Path                   | Qué es                                         |
 | ---------------------- | ---------------------------------------------- |
 | `~/.cache`             | Caches de paquetes (paru/AUR, pip, npm, etc.)  |
+| `~/.tmp`               | Scratch space temporal (no son proyectos)      |
 | `~/.local/share/Trash` | Papelera de Linux                              |
 | `~/.nvm`               | Versiones de Node instaladas (nvm)             |
 | `~/.pi/agent`          | Runtime de Pi (herramientas instaladas por Pi) |

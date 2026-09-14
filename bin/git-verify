@@ -26,6 +26,10 @@ FETCH_PARALLEL=4  # Fetch paralelo: default 4, máximo 16. 1 = serial (--no-para
 DO_PULL=0
 PULL_FF_ONLY=1    # Default seguro: solo fast-forward. Override con --rebase o --no-ff-only.
 PULL_REBASE=0
+# Forzar bash puro en --pull (saltar gum). Se puede setear con flag --no-gum
+# o variable de entorno GIT_VERIFY_NO_GUM=1. Útil cuando gum no se ve en tu
+# terminal (problema conocido con Ghostty + bubbletea).
+NO_GUM="${GIT_VERIFY_NO_GUM:-0}"
 # Si --pull, fetch se activa implícitamente (lo marcamos acá y lo aplicamos
 # despues de parsear args, en el bloque de auto-fetch).
 
@@ -217,6 +221,10 @@ Opciones:
                       --ff-only. Reescribe tu historia local.
       --no-ff-only    Con --pull, usa `git pull` clásico (merge commit).
                       Menos seguro para scripts automáticos.
+      --no-gum        Con --pull, fuerza el selector bash puro (números)
+                      en vez de la TUI de gum. Útil si gum no se ve
+                      en tu terminal (Ghostty + bubbletea son incompat
+                      en algunas versiones). Equivale a GIT_VERIFY_NO_GUM=1.
       --only-pending  Oculta los repos clean. Default: muestra todos.
       --detailed      Al final, llama a mgitstatus para info detallada
                       de los repos GitHub. Necesita mgitstatus instalado.
@@ -510,13 +518,16 @@ select_pull_targets() {
   local -a selected_paths=()
 
   # Decidir UNA vez si podemos usar gum. Necesitamos:
+  #   - el user no haya pedido saltarlo (--no-gum o GIT_VERIFY_NO_GUM=1)
   #   - gum instalado
   #   - stdout sea TTY real
   #   - /dev/tty accesible (algunos entornos restringidos — VSCode,
-  #     paneles de tmux con permisos raros, ssh sin -t, etc. — tienen
-  #     stdout TTY pero gum no puede abrir /dev/tty y se queda colgado)
+  #     paneles de tmux con permisos raros, ssh sin -t, Ghostty con
+  #     bubbletea — tienen stdout TTY pero gum o no puede abrir /dev/tty,
+  #     o abre la TUI en alternate buffer que el emulador no renderiza)
   local use_gum=0
-  if command -v gum >/dev/null 2>&1 && [[ -t 1 ]] \
+  if [[ "${NO_GUM:-0}" != "1" ]] \
+     && command -v gum >/dev/null 2>&1 && [[ -t 1 ]] \
      && [[ -e /dev/tty && -r /dev/tty && -w /dev/tty ]]; then
     use_gum=1
   fi
@@ -533,10 +544,12 @@ select_pull_targets() {
     selected_paths=("${items[0]}")
   elif [[ "$use_gum" -eq 1 ]]; then
     # --- UX con gum, con timeout defensivo ---
-    # timeout 60s: si gum se cuelga (raro), matamos el proceso y caemos al
-    # bash puro en lugar de dejar al usuario mirando una pantalla muerta.
+    # timeout 30s + SIGKILL 5s después: si gum no responde a SIGTERM
+    # (puede pasar si está bloqueado en syscall de TTY), lo matamos
+    # forzosamente y caemos al bash puro. Mejor que dejar al usuario
+    # con pantalla muerta.
     local picked_str
-    picked_str="$(timeout 60 gum choose --no-limit \
+    picked_str="$(timeout --kill-after=5 30 gum choose --no-limit \
       --header "Seleccioná repos para hacer pull (espacio=toggle, enter=OK)" \
       --cursor-prefix " → " \
       --selected-prefix " ✓ " \
@@ -777,6 +790,7 @@ while [[ $# -gt 0 ]]; do
     --pull)            DO_PULL=1; shift ;;
     --rebase)          PULL_REBASE=1; PULL_FF_ONLY=0; shift ;;
     --no-ff-only)      PULL_FF_ONLY=0; shift ;;
+    --no-gum)          NO_GUM=1; shift ;;
     --only-pending)    ONLY_PENDING=1; shift ;;
     --detailed)        SHOW_DETAILED=1; shift ;;
     --include-all)     EXCLUDE_NOISE=0; shift ;;

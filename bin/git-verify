@@ -26,10 +26,6 @@ FETCH_PARALLEL=4  # Fetch paralelo: default 4, máximo 16. 1 = serial (--no-para
 DO_PULL=0
 PULL_FF_ONLY=1    # Default seguro: solo fast-forward. Override con --rebase o --no-ff-only.
 PULL_REBASE=0
-# Forzar bash puro en --pull (saltar gum). Se puede setear con flag --no-gum
-# o variable de entorno GIT_VERIFY_NO_GUM=1. Útil cuando gum no se ve en tu
-# terminal (problema conocido con Ghostty + bubbletea).
-NO_GUM="${GIT_VERIFY_NO_GUM:-0}"
 # Si --pull, fetch se activa implícitamente (lo marcamos acá y lo aplicamos
 # despues de parsear args, en el bloque de auto-fetch).
 
@@ -221,10 +217,6 @@ Opciones:
                       --ff-only. Reescribe tu historia local.
       --no-ff-only    Con --pull, usa `git pull` clásico (merge commit).
                       Menos seguro para scripts automáticos.
-      --no-gum        Con --pull, fuerza el selector bash puro (números)
-                      en vez de la TUI de gum. Útil si gum no se ve
-                      en tu terminal (Ghostty + bubbletea son incompat
-                      en algunas versiones). Equivale a GIT_VERIFY_NO_GUM=1.
       --only-pending  Oculta los repos clean. Default: muestra todos.
       --detailed      Al final, llama a mgitstatus para info detallada
                       de los repos GitHub. Necesita mgitstatus instalado.
@@ -233,9 +225,7 @@ Opciones:
   -h, --help         Esta ayuda.
 
 Dependencias:
-  bash, git, find   (mgitstatus solo es obligatorio con --detailed,
-                      gum solo si querés TUI bonita en --pull; sin gum
-                      usa selector bash puro)
+  bash, git, find   (mgitstatus solo es obligatorio con --detailed)
 
 Carpetas de ruido excluidas por default:
   ~/.cache, ~/.local/share/Trash, ~/.nvm, ~/.pi/agent
@@ -498,127 +488,64 @@ gather_pull_candidates() {
   done
 }
 
-# Muestra TUI para elegir repos. Auto-detecta gum:
-#   - si está: gum choose --no-limit, devuelve labels seleccionados
-#   - si no: bash puro con números
-# Argumentos: ninguno. Lee PULL_CANDIDATES.
-# Devuelve por stdout una lista de paths newline-separated.
-# Exit codes: 0 si hay selección, 1 si cancelado / inválido.
+# Lee la selección del usuario y emite paths por stdout (uno por línea).
+# stdin debe ser TTY interactiva (chequeado por el caller).
+# Exit 0 si hay selección, 1 si cancelado o vacío.
 select_pull_targets() {
-  local -a items=() labels=()
-  local csv path name behind
+  local -a items=()
+  local csv path
   for csv in "${PULL_CANDIDATES[@]}"; do
     path="${csv%%|*}"
-    name="$(basename "$path")"
-    IFS='|' read -r _ _ _ _ _ _ _ _ _ _ behind <<<"$csv"
     items+=("$path")
-    labels+=("$name | $behind behind")
   done
 
-  local -a selected_paths=()
+  printf '\nRepos disponibles para pull:\n' >&2
+  printf '%s\n' '------------------------------------------------------------' >&2
+  local i
+  for i in "${!items[@]}"; do
+    printf '  [%d] %s\n' "$((i+1))" "$(basename "${items[$i]}")" >&2
+  done
+  printf '\nSeleccioná (ej: 1,3  o  1-3  o  all  o  q para salir): ' >&2
 
-  # Decidir UNA vez si podemos usar gum. Necesitamos:
-  #   - el user no haya pedido saltarlo (--no-gum o GIT_VERIFY_NO_GUM=1)
-  #   - gum instalado
-  #   - stdout sea TTY real
-  #   - /dev/tty accesible (algunos entornos restringidos — VSCode,
-  #     paneles de tmux con permisos raros, ssh sin -t, Ghostty con
-  #     bubbletea — tienen stdout TTY pero gum o no puede abrir /dev/tty,
-  #     o abre la TUI en alternate buffer que el emulador no renderiza)
-  local use_gum=0
-  if [[ "${NO_GUM:-0}" != "1" ]] \
-     && command -v gum >/dev/null 2>&1 && [[ -t 1 ]] \
-     && [[ -e /dev/tty && -r /dev/tty && -w /dev/tty ]]; then
-    use_gum=1
-  fi
+  local sel
+  read -r sel || sel=""
+  case "${sel,,}" in
+    ""|q|quit|n|no)
+      return 1
+      ;;
+    all|a)
+      printf '%s\n' "${items[@]}"
+      return 0
+      ;;
+  esac
 
-  if [[ "${#labels[@]}" -eq 1 ]]; then
-    # Único candidato: no abrimos selector, solo pedimos Enter.
-    # Aplica tanto para gum como para bash puro (con 1 solo item no tiene
-    # sentido abrir TUI).
-    printf '\n%sHay 1 repo candidato para pull:%s\n' "$C_BOLD" "$C_RESET" >&2
-    printf '  • %s\n' "${labels[0]}" >&2
-    printf '\n%sEnter para hacer pull, Ctrl-C para cancelar: %s' "$C_DIM" "$C_RESET" >&2
-    local _
-    read -r _ || { return 1; }
-    selected_paths=("${items[0]}")
-  elif [[ "$use_gum" -eq 1 ]]; then
-    # --- UX con gum, con timeout defensivo ---
-    # timeout 30s + SIGKILL 5s después: si gum no responde a SIGTERM
-    # (puede pasar si está bloqueado en syscall de TTY), lo matamos
-    # forzosamente y caemos al bash puro. Mejor que dejar al usuario
-    # con pantalla muerta.
-    local picked_str
-    picked_str="$(timeout --kill-after=5 30 gum choose --no-limit \
-      --header "Seleccioná repos para hacer pull (espacio=toggle, enter=OK)" \
-      --cursor-prefix " → " \
-      --selected-prefix " ✓ " \
-      "${labels[@]}" 2>/dev/null || true)"
-    [[ -z "$picked_str" ]] && return 1
-    local line
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      # line = "name | N behind"
-      local pname="${line%% | *}"
-      local i
-      for i in "${!labels[@]}"; do
-        if [[ "${labels[$i]%% | *}" == "$pname" ]]; then
-          selected_paths+=("${items[$i]}")
-          break
-        fi
+  # Parsear "1,3,5-7" → picks=[1,3,5,6,7]
+  local -a picks=()
+  local part lo hi n
+  IFS=',' read -ra parts <<<"$sel"
+  for part in "${parts[@]}"; do
+    part="${part// /}"  # trim spaces
+    [[ -z "$part" ]] && continue
+    if [[ "$part" == *-* ]]; then
+      lo="${part%-*}"; hi="${part#*-}"
+      for ((n=lo; n<=hi; n++)); do
+        [[ "$n" -ge 1 && "$n" -le "${#items[@]}" ]] && picks+=("$n")
       done
-    done <<<"$picked_str"
-  else
-    # --- UX bash puro ---
-    # Toda la UI va a stderr (&2) para no contaminar el stdout que el caller
-    # redirige al tmpfile con los paths seleccionados.
-    printf '\n%sRepos disponibles para pull:%s\n' "$C_BOLD" "$C_RESET" >&2
-    printf '%s%s%s\n' "$C_DIM" "------------------------------------------------------------" "$C_RESET" >&2
-    local i
-    for i in "${!labels[@]}"; do
-      printf '  %s[%d]%s %s\n' "$C_DIM" "$((i+1))" "$C_RESET" "${labels[$i]}" >&2
-    done
-    printf '\n%sSeleccioná (ej: 1,3  o  1-3  o  all  o  q para salir): %s' "$C_DIM" "$C_RESET" >&2
-    local sel
-    read -r sel || sel=""
-    case "${sel,,}" in
-      ""|q|quit|n|no) return 1 ;;
-      all|a)
-        selected_paths=("${items[@]}")
-        ;;
-      *)
-        # Parsear "1,3,5-7" → expandimos a [1,3,5,6,7]
-        local -a picks=()
-        local token part lo hi n
-        IFS=',' read -ra parts <<<"$sel"
-        for part in "${parts[@]}"; do
-          part="${part// /}"  # trim spaces
-          [[ -z "$part" ]] && continue
-          if [[ "$part" == *-* ]]; then
-            lo="${part%-*}"; hi="${part#*-}"
-            for ((n=lo; n<=hi; n++)); do
-              [[ "$n" -ge 1 && "$n" -le "${#items[@]}" ]] && picks+=("$n")
-            done
-          elif [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le "${#items[@]}" ]]; then
-            picks+=("$part")
-          else
-            printf '%s  (ignorando "%s")\n%s' "$C_DIM" "$part" "$C_RESET" >&2
-          fi
-        done
-        # Deduplicar y mapear a paths
-        local seen="" p
-        for p in "${picks[@]}"; do
-          if [[ ",$seen," != *",$p,"* ]]; then
-            seen="${seen:+$seen,}$p"
-            selected_paths+=("${items[$((p-1))]}")
-          fi
-        done
-        ;;
-    esac
-  fi
+    elif [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le "${#items[@]}" ]]; then
+      picks+=("$part")
+    fi
+  done
 
-  [[ "${#selected_paths[@]}" -gt 0 ]] || return 1
-  printf '%s\n' "${selected_paths[@]}"
+  [[ ${#picks[@]} -gt 0 ]] || return 1
+
+  local seen="" p
+  for p in "${picks[@]}"; do
+    if [[ ",$seen," != *",$p,"* ]]; then
+      seen="${seen:+$seen,}$p"
+      printf '%s\n' "${items[$((p-1))]}"
+    fi
+  done
+  return 0
 }
 
 # Pide confirmación. Argumentos: $1=desc_cmd, $2..$N=paths.
@@ -674,13 +601,21 @@ run_pull_one() {
   fi
 }
 
-# Orquesta: candidatos → selección → confirmación → loop pull → resumen.
+# Orquesta: candidatos → chequeo TTY → selección → confirmación → pull.
 pull_phase() {
   gather_pull_candidates
   if [[ "${#PULL_CANDIDATES[@]}" -eq 0 ]]; then
-    printf '\n%s--pull: ningún repo es candidato (todos con cambios locales, divergentes o ya al día)%s\n' \
-      "$C_DIM" "$C_RESET"
+    printf '\n--pull: ningún repo es candidato (todos con cambios locales, divergentes o ya al día)\n'
     return 0
+  fi
+
+  # --pull necesita stdin interactiva (leemos selección). Si te lo pipes
+  # desde otro comando o lo corrés desde cron, no podemos preguntar y
+  # salimos con error claro en vez de quedarnos colgados.
+  if [[ ! -t 0 ]]; then
+    err "--pull necesita una terminal interactiva (stdin no es TTY)."
+    err "Si querés automatizarlo, agregá un flag --yes o algo similar en otra iteración."
+    return 2
   fi
 
   # Decidir comando
@@ -693,23 +628,23 @@ pull_phase() {
     pull_cmd="pull"
   fi
 
-  # Selección
+  # Selección: select_pull_targets imprime los paths a stdout. Capturamos
+  # con mapfile (sin tmpfile, sin redirecciones raras).
   local -a selected=()
-  local tmpfile
-  tmpfile="$(mktemp 2>/dev/null || echo "/tmp/gv-pull-sel-$$")"
-  if select_pull_targets > "$tmpfile" 2>/dev/null; then
-    mapfile -t selected < "$tmpfile"
+  if selected_str="$(select_pull_targets)"; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && selected+=("$line")
+    done <<<"$selected_str"
   fi
-  rm -f "$tmpfile" 2>/dev/null
 
   if [[ "${#selected[@]}" -eq 0 ]]; then
-    printf '\n%s--pull cancelado o sin selección%s\n' "$C_DIM" "$C_RESET"
+    printf '\n--pull cancelado o sin selección\n'
     return 0
   fi
 
   # Confirmación
   if ! confirm_pull "git $pull_cmd" "${selected[@]}"; then
-    printf '\n%sCancelado por el usuario%s\n' "$C_DIM" "$C_RESET"
+    printf '\nCancelado por el usuario\n'
     return 0
   fi
 
@@ -790,7 +725,6 @@ while [[ $# -gt 0 ]]; do
     --pull)            DO_PULL=1; shift ;;
     --rebase)          PULL_REBASE=1; PULL_FF_ONLY=0; shift ;;
     --no-ff-only)      PULL_FF_ONLY=0; shift ;;
-    --no-gum)          NO_GUM=1; shift ;;
     --only-pending)    ONLY_PENDING=1; shift ;;
     --detailed)        SHOW_DETAILED=1; shift ;;
     --include-all)     EXCLUDE_NOISE=0; shift ;;

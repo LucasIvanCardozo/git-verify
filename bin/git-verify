@@ -2,8 +2,7 @@
 #
 # git-verify - Escanea un árbol de directorios y lista los repos git que
 # encuentra, separando los que apuntan a GitHub de los que apuntan a otros
-# remotes. Para cada repo muestra info útil: branch, remote y estado de
-# cambios.
+# remotes. Para cada repo muestra estado de cambios con formato compacto.
 #
 # Sin dependencias obligatorias más allá de bash, git y find. `mgitstatus`
 # solo es necesario si usás --detailed.
@@ -12,26 +11,42 @@
 
 set -euo pipefail
 
+# git NO debe pedir credenciales interactivamente. Si un fetch las
+# requiere, falla limpio en vez de quedar colgado.
+export GIT_TERMINAL_PROMPT=0
+
 # -------- Defaults --------
 SCAN_DIR="$HOME"
 DEPTH=0           # 0 = sin límite (escanea todo el árbol bajo SCAN_DIR)
 DO_FETCH=0
 ONLY_PENDING=0
 SHOW_DETAILED=0
-EXCLUDE_NOISE=1   # por default excluimos cache, trash y otros (ver NOISE_DIRS)
+EXCLUDE_NOISE=1
 
-# Paths que casi nunca son "proyectos tuyos" pero contienen .git dirs:
-#   - ~/.cache/paru/clone/  → clones temporales de AUR
-#   - ~/.local/share/Trash/ → papelera de Linux
-#   - ~/.nvm/               → versiones de Node (no son proyectos)
-#   - ~/.pi/agent/          → runtime de Pi
-# Con --include-all los incluís de vuelta.
+# Paths que casi nunca son "proyectos tuyos" pero contienen .git dirs.
 NOISE_DIRS=(
   "*/.cache"
   "*/.local/share/Trash"
   "*/.nvm"
   "*/.pi/agent"
 )
+
+# Color solo si stdout es una terminal interactiva.
+if [[ -t 1 ]]; then
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+  C_RESET=$'\033[0m'
+else
+  C_RED=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_DIM=""
+  C_BOLD=""
+  C_RESET=""
+fi
 
 # -------- Helpers --------
 usage() {
@@ -48,13 +63,15 @@ Opciones:
   -d, --depth N      Profundidad máxima (default: 0 = sin límite).
                      Cuenta el dir de partida: raiz/<x>/.git = 2.
                      Con el default escaneamos el árbol completo.
-      --fetch         Hace 'git fetch --quiet' antes de chequear. Toca
-                      cada remote. Hace que "needs pull" sea preciso.
+      --fetch         Hace 'git fetch --quiet' antes. Toca cada remote.
+                      Hace que "needs pull" sea preciso. Si algún repo
+                      requiere autenticación, falla limpio (no queda
+                      colgado pidiendo user/pass).
       --only-pending  Oculta los repos clean. Default: muestra todos.
-      --detailed      Al final, llama a mgitstatus para info detallada de
-                      los repos GitHub. Necesita mgitstatus instalado.
-      --include-all   No excluye las carpetas de "ruido" (cache, trash, nvm).
-                      Por default se filtran automáticamente.
+      --detailed      Al final, llama a mgitstatus para info detallada
+                      de los repos GitHub. Necesita mgitstatus instalado.
+      --include-all   No excluye las carpetas de "ruido" (cache, trash,
+                      nvm, .pi/agent). Por default se filtran.
   -h, --help         Esta ayuda.
 
 Dependencias:
@@ -67,7 +84,6 @@ EOF
 
 err() { echo "Error: $*" >&2; }
 
-# Devuelve 0 si algún remote del repo apunta a github.com (case-insensitive).
 is_github_repo() {
   local repo="$1" remote url
   while IFS= read -r remote; do
@@ -80,13 +96,10 @@ is_github_repo() {
   return 1
 }
 
-# Imprime una línea CSV (separada por '|') con info del repo.
-# Campos: path|branch|remote|is_clean|staged|unstaged|untracked|has_upstream|is_bare
 gather_repo_info() {
   local repo="$1"
   local branch="" remote_url="" staged=0 unstaged=0 untracked=0 upstream="" has_up=0 is_bare=0 is_clean=1
 
-  # Bare repos los detectamos y etiquetamos (no tienen working dir).
   if [[ "$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null || echo false)" == "true" ]]; then
     is_bare=1
   fi
@@ -94,12 +107,10 @@ gather_repo_info() {
   if [[ "$is_bare" -eq 0 ]]; then
     branch="$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null || true)"
     if [[ -z "$branch" ]]; then
-      # Detached HEAD: mostramos hash corto con prefijo para distinguirlo.
       local _hash
       _hash="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
       branch="detached:$_hash"
     fi
-    # Truncamos si fuera muy largo para mantener la línea legible.
     if [[ "${#branch}" -gt 24 ]]; then
       branch="${branch:0:21}..."
     fi
@@ -112,65 +123,171 @@ gather_repo_info() {
         remote_url="$(git -C "$repo" config --get "remote.$first_remote.url" 2>/dev/null || true)"
       fi
     fi
-    remote_url="${remote_url:-"(sin remote)"}"
+    remote_url="${remote_url:-}"
 
     staged="$(git -C "$repo" diff --cached --name-only 2>/dev/null | wc -l || echo 0)"
     unstaged="$(git -C "$repo" diff --name-only 2>/dev/null | wc -l || echo 0)"
     untracked="$(git -C "$repo" ls-files --others --exclude-standard 2>/dev/null | wc -l || echo 0)"
-    if [[ "$staged" -eq 0 && "$unstaged" -eq 0 && "$untracked" -eq 0 ]]; then
+    upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+    [[ -n "$upstream" ]] && has_up=1
+
+    if [[ "$staged" -eq 0 && "$unstaged" -eq 0 && "$untracked" -eq 0 && "$has_up" -eq 1 ]]; then
       is_clean=1
     else
       is_clean=0
     fi
-
-    upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
-    [[ -n "$upstream" ]] && has_up=1
   else
     branch="(bare)"
-    remote_url="(bare)"
+    remote_url=""
   fi
 
   printf '%s\n' "${repo}|${branch}|${remote_url}|${is_clean}|${staged}|${unstaged}|${untracked}|${has_up}|${is_bare}"
 }
 
-# Path relativo a SCAN_DIR para display; usa basename si quedan en ".".
-relative_path() {
-  local repo="$1"
-  local rel
-  rel="$(realpath --relative-to="$SCAN_DIR" "$repo" 2>/dev/null || true)"
-  if [[ -z "$rel" || "$rel" == "." ]]; then
-    rel="$(basename "$repo")"
-  fi
-  echo "$rel"
-}
-
-# Imprime la línea principal de un repo: icono + path + (branch) + remote.
-print_repo_line() {
-  local csv="$1" rel="$2"
-  IFS='|' read -r _path branch remote is_clean _ _ _ _ is_bare <<<"$csv"
-  if [[ "$is_bare" == "1" ]]; then
-    printf '  - %-40s [bare]\n' "$rel"
+short_remote_tag() {
+  local url="$1"
+  if [[ -z "$url" ]]; then
+    echo "sin remote"
     return
   fi
-  local icon="✓"
-  [[ "$is_clean" == "1" ]] || icon="!"
-  printf '  %s %-40s  (%s)  %s\n' "$icon" "$rel" "$branch" "$remote"
+  local domain
+  domain="$(echo "$url" \
+    | sed -E 's|^https?://([^/]+)/.*$|\1|; s|^git@([^:]+):.*$|\1|; s|^ssh://git@([^/]+)/.*$|\1|')"
+  case "$domain" in
+    github.com)            echo "github" ;;
+    gitlab.com|gitlab.*)   echo "gitlab" ;;
+    bitbucket.org)         echo "bitbucket" ;;
+    codeberg.org)          echo "codeberg" ;;
+    sourcehut.org)         echo "sourcehut" ;;
+    aur.archlinux.org)     echo "aur" ;;
+    *)                     echo "$domain" ;;
+  esac
 }
 
-# Imprime la sublínea con detalle de cambios si está sucio.
-print_repo_status() {
-  local csv="$1"
-  IFS='|' read -r _ _ _ is_clean staged unstaged untracked has_up is_bare <<<"$csv"
-  [[ "$is_clean" == "1" || "$is_bare" == "1" ]] && return
-  local parts=()
-  [[ "$staged"    -gt 0 ]] && parts+=("staged:$staged")
-  [[ "$unstaged"  -gt 0 ]] && parts+=("unstaged:$unstaged")
-  [[ "$untracked" -gt 0 ]] && parts+=("untracked:$untracked")
-  [[ "$has_up"    == "0" ]] && parts+=("needs upstream")
-  [[ "${#parts[@]}" -eq 0 ]] && parts+=("dirty")
-  local joined
-  joined="$(IFS=' · '; echo "${parts[*]}")"
-  printf '       └─ %s\n' "$joined"
+fmt_count() {
+  local n=$1 word=$2
+  [[ "$n" -gt 0 ]] && echo "$n $word" || true
+}
+
+# Imprime la línea de un repo. Argumentos:
+#   $1 = csv, $2 = name (basename), $3 = colored icon (con sus C_*),
+#   $4 = branch, $5 = show_remote (0|1)
+print_repo_line() {
+  local csv="$1" name="$2" colored_icon="$3" branch="$4" show_remote="$5"
+  IFS='|' read -r _ _ _ _ staged unstaged untracked has_up is_bare <<<"$csv"
+
+  local -a parts=()
+  [[ "$staged"    -gt 0 ]] && parts+=("$(fmt_count "$staged" "staged")")
+  [[ "$unstaged"  -gt 0 ]] && parts+=("$(fmt_count "$unstaged" "unstaged")")
+  [[ "$untracked" -gt 0 ]] && parts+=("$(fmt_count "$untracked" "untracked")")
+  [[ "$has_up"    == "0" && "$is_bare" != "1" ]] && parts+=("needs upstream")
+  local state=""
+  if [[ "${#parts[@]}" -gt 0 ]]; then
+    # printf repite formato por arg; usamos "%s · " y recortamos el " · " final.
+    state="$(printf '%s · ' "${parts[@]}")"
+    state="${state% · }"
+  fi
+
+  # Branch se oculta si es main/master/develop (cosas esperadas).
+  local branch_tag=""
+  case "$branch" in
+    main|master|develop|"") branch_tag="" ;;
+    *)                      branch_tag="($branch) " ;;
+  esac
+
+  if [[ "$show_remote" -eq 1 ]]; then
+    local _url
+    IFS='|' read -r _ _ _remote _ _ _ _ _ _ <<<"$csv"
+    local tag
+    tag="$(short_remote_tag "$_remote")"
+    printf '  %s %s  %s%s%s [%s]%s\n' \
+      "$colored_icon" "$name" "$branch_tag" "$state" \
+      "$C_DIM" "$tag" "$C_RESET"
+  else
+    printf '  %s %s  %s%s\n' \
+      "$colored_icon" "$name" "$branch_tag" "$state"
+  fi
+}
+
+# Renderiza una sección (gh u otros). Lee los conteos y arrays globales.
+render_section() {
+  local section_type="$1"
+  local title total dirty_n clean_n
+  local -a dirty_arr clean_arr
+
+  case "$section_type" in
+    gh)
+      title="GitHub"
+      total=$gh_total
+      dirty_n=$gh_dirty_count
+      clean_n=$gh_clean_count
+      if [[ "${#GH_DIRTY[@]}" -gt 0 ]]; then
+        dirty_arr=("${GH_DIRTY[@]}")
+      fi
+      if [[ "${#GH_CLEAN[@]}" -gt 0 ]]; then
+        clean_arr=("${GH_CLEAN[@]}")
+      fi
+      ;;
+    other)
+      title="Otros remotes"
+      total=$other_total
+      dirty_n=$other_dirty_count
+      clean_n=$other_clean_count
+      if [[ "${#OTHER_DIRTY[@]}" -gt 0 ]]; then
+        dirty_arr=("${OTHER_DIRTY[@]}")
+      fi
+      if [[ "${#OTHER_CLEAN[@]}" -gt 0 ]]; then
+        clean_arr=("${OTHER_CLEAN[@]}")
+      fi
+      ;;
+  esac
+
+  printf '%s▶ %s (%d repos · %d con cambios)%s\n' \
+    "$C_BOLD" "$title" "$total" "$dirty_n" "$C_RESET"
+  printf '%s%s%s\n' "$C_DIM" "------------------------------------------------------------" "$C_RESET"
+
+  if [[ "$total" -eq 0 ]]; then
+    printf '  %s(nada en esta categoría)%s\n' "$C_DIM" "$C_RESET"
+    echo ""
+    return
+  fi
+
+  # Dirty
+  if [[ "$dirty_n" -gt 0 ]]; then
+    for csv in "${dirty_arr[@]}"; do
+      local name branch
+      name="$(basename "${csv%%|*}")"
+      IFS='|' read -r _ _ _ _ _ _ _ _ _ branch <<<"$csv"
+      if [[ "$section_type" == "gh" ]]; then
+        print_repo_line "$csv" "$name" "${C_RED}!${C_RESET}" "$branch" 0
+      else
+        print_repo_line "$csv" "$name" "${C_RED}!${C_RESET}" "$branch" 1
+      fi
+    done
+  elif [[ "$ONLY_PENDING" -eq 0 && "$clean_n" -gt 0 ]]; then
+    # No hay pendientes, vamos directo al bloque clean más abajo.
+    printf '  %s(sin proyectos con cambios)%s\n' "$C_DIM" "$C_RESET"
+  fi
+
+  # Clean (solo si no estamos en --only-pending)
+  if [[ "$ONLY_PENDING" -eq 0 && "$clean_n" -gt 0 ]]; then
+    if [[ "$dirty_n" -gt 0 ]]; then
+      printf '\n  %s─ clean (%d) ─%s\n' "$C_DIM" "$clean_n" "$C_RESET"
+    fi
+    for csv in "${clean_arr[@]}"; do
+      local name branch is_bare
+      name="$(basename "${csv%%|*}")"
+      IFS='|' read -r _ _ _ _ _ _ _ _ is_bare branch <<<"$csv"
+      if [[ "$is_bare" == "1" ]]; then
+        printf '  %s- %s  %s(bare)%s\n' "$C_DIM" "$name" "$C_DIM" "$C_RESET"
+      elif [[ "$section_type" == "gh" ]]; then
+        print_repo_line "$csv" "$name" "${C_GREEN}✓${C_RESET}" "$branch" 0
+      else
+        print_repo_line "$csv" "$name" "${C_GREEN}✓${C_RESET}" "$branch" 1
+      fi
+    done
+  fi
+  echo ""
 }
 
 # -------- Parseo de argumentos --------
@@ -221,19 +338,18 @@ else
   FIND_ARGS=(-maxdepth "$DEPTH")
 fi
 
-# Construir el filtro de paths excluidos (carpetas de ruido) si corresponde.
 PRUNE_ARGS=()
 if [[ "$EXCLUDE_NOISE" -eq 1 ]]; then
-  PRUNE_ARGS=(\()
+  PRUNE_ARGS+=('(')
   i=0
   for noise in "${NOISE_DIRS[@]}"; do
     if [[ $i -gt 0 ]]; then
-      PRUNE_ARGS+=(-o)
+      PRUNE_ARGS+=('-o')
     fi
-    PRUNE_ARGS+=(-path "$noise")
+    PRUNE_ARGS+=('-path' "$noise")
     i=$((i + 1))
   done
-  PRUNE_ARGS+=(\) -prune -o)
+  PRUNE_ARGS+=(')' '-prune' '-o')
 fi
 
 mapfile -t ALL_REPOS < <(
@@ -246,84 +362,93 @@ if [[ "${#ALL_REPOS[@]}" -eq 0 ]]; then
   exit 0
 fi
 
-# -------- Optional fetch --------
+# -------- Optional fetch (con tolerancia) --------
+declare -a FETCH_FAILURES=()
 if [[ "$DO_FETCH" -eq 1 ]]; then
   for repo in "${ALL_REPOS[@]}"; do
-    git -C "$repo" fetch --quiet 2>/dev/null || true
+    if ! git -C "$repo" fetch --quiet 2>/dev/null; then
+      FETCH_FAILURES+=("$repo")
+    fi
   done
 fi
 
 # -------- Categorizar + gather --------
-declare -a GH_INFO=()
-declare -a OTHER_INFO=()
-declare -a GH_PATHS=()       # paths originales para --detailed
+declare -a GH_DIRTY=()
+declare -a GH_CLEAN=()
+declare -a OTHER_DIRTY=()
+declare -a OTHER_CLEAN=()
+declare -a GH_PATHS=()
 gh_total=0
 other_total=0
+gh_dirty_count=0
+gh_clean_count=0
+other_dirty_count=0
+other_clean_count=0
 
 for repo in "${ALL_REPOS[@]}"; do
+  csv="$(gather_repo_info "$repo")"
+  IFS='|' read -r _ _ _ is_clean _ _ _ _ _ <<<"$csv"
+
   if is_github_repo "$repo"; then
     gh_total=$((gh_total + 1))
-    csv="$(gather_repo_info "$repo")"
-    if [[ "$ONLY_PENDING" -eq 1 ]]; then
-      IFS='|' read -r _ _ _ is_clean _ _ _ _ _ <<<"$csv"
-      [[ "$is_clean" == "1" ]] && continue
-    fi
-    GH_INFO+=("$csv")
     GH_PATHS+=("$repo")
+    if [[ "$is_clean" == "1" ]]; then
+      gh_clean_count=$((gh_clean_count + 1))
+      GH_CLEAN+=("$csv")
+    else
+      gh_dirty_count=$((gh_dirty_count + 1))
+      GH_DIRTY+=("$csv")
+    fi
   else
     other_total=$((other_total + 1))
-    csv="$(gather_repo_info "$repo")"
-    if [[ "$ONLY_PENDING" -eq 1 ]]; then
-      IFS='|' read -r _ _ _ is_clean _ _ _ _ _ <<<"$csv"
-      [[ "$is_clean" == "1" ]] && continue
+    if [[ "$is_clean" == "1" ]]; then
+      other_clean_count=$((other_clean_count + 1))
+      OTHER_CLEAN+=("$csv")
+    else
+      other_dirty_count=$((other_dirty_count + 1))
+      OTHER_DIRTY+=("$csv")
     fi
-    OTHER_INFO+=("$csv")
   fi
 done
 
+# -------- Clear visual (solo TTY) --------
+[[ -t 1 ]] && clear
+
 # -------- Header --------
-echo "git-verify — $SCAN_DIR (depth=$DEPTH)"
-echo "${#ALL_REPOS[@]} repos | $gh_total en GitHub | $other_total en otros remotes"
-[[ "$DO_FETCH" -eq 1 ]]     && echo "fetch activado · tocando cada remote"
-[[ "$ONLY_PENDING" -eq 1 ]] && echo "filtro: solo pendientes"
-echo ""
+total=${#ALL_REPOS[@]}
+total_dirty=$((gh_dirty_count + other_dirty_count))
 
-# -------- Sección GitHub --------
-printf 'GitHub (%d)\n' "$gh_total"
-printf -- '----------------------------------------\n'
-if [[ "$gh_total" -eq 0 ]]; then
-  echo "  (no se encontraron repos con remote en github.com)"
-elif [[ "${#GH_INFO[@]}" -eq 0 ]]; then
-  echo "  (todos clean con --only-pending)"
-else
-  for csv in "${GH_INFO[@]}"; do
-    rel="$(relative_path "${csv%%|*}")"
-    print_repo_line "$csv" "$rel"
-    print_repo_status "$csv"
-  done
+printf '%sgit-verify%s  %d repos · %d con cambios pendientes\n' \
+  "$C_BOLD" "$C_RESET" "$total" "$total_dirty"
+if [[ "$SCAN_DIR" != "$HOME" ]]; then
+  printf '%s%s%s\n' "$C_DIM" "$SCAN_DIR" "$C_RESET"
 fi
+[[ "$DO_FETCH" -eq 1 ]]     && printf '%sfetch activado · se tocó cada remote%s\n' "$C_DIM" "$C_RESET"
+[[ "$ONLY_PENDING" -eq 1 ]] && printf '%sfiltro: solo pendientes%s\n' "$C_DIM" "$C_RESET"
 echo ""
 
-# -------- Sección Otros --------
-printf 'Otros remotes (%d)\n' "$other_total"
-printf -- '----------------------------------------\n'
-if [[ "$other_total" -eq 0 ]]; then
-  echo "  (todos los repos apuntan a github.com, o no tienen remote)"
-elif [[ "${#OTHER_INFO[@]}" -eq 0 ]]; then
-  echo "  (todos clean con --only-pending)"
-else
-  for csv in "${OTHER_INFO[@]}"; do
-    rel="$(relative_path "${csv%%|*}")"
-    print_repo_line "$csv" "$rel"
-    print_repo_status "$csv"
-  done
+# -------- Secciones --------
+render_section "gh"
+render_section "other"
+
+# -------- Resumen de fetch --------
+if [[ "$DO_FETCH" -eq 1 ]]; then
+  ok_count=$((${#ALL_REPOS[@]} - ${#FETCH_FAILURES[@]}))
+  fail_count=${#FETCH_FAILURES[@]}
+  printf '%sfetch: %d ok · %d fallaron (sin auth o sin red)%s\n' \
+    "$C_DIM" "$ok_count" "$fail_count" "$C_RESET"
+  if [[ "$fail_count" -gt 0 ]]; then
+    for repo in "${FETCH_FAILURES[@]}"; do
+      printf '         %s- %s%s\n' "$C_DIM" "$(basename "$repo")" "$C_RESET"
+    done
+  fi
+  echo ""
 fi
 
 # -------- Sección detallada (opcional) --------
 if [[ "$SHOW_DETAILED" -eq 1 && "${#GH_PATHS[@]}" -gt 0 ]]; then
-  echo ""
-  echo "Detalle de GitHub (mgitstatus)"
-  echo "----------------------------------------"
+  printf '%sDetalle de GitHub (mgitstatus)%s\n' "$C_BOLD" "$C_RESET"
+  printf '%s%s%s\n' "$C_DIM" "------------------------------------------------------------" "$C_RESET"
   if [[ "$ONLY_PENDING" -eq 1 ]]; then
     mgitstatus -e "${GH_PATHS[@]}" 2>/dev/null || true
   else

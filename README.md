@@ -91,6 +91,16 @@ git-verify --help                       # ayuda completa
 | `--include-all`    | off     | No excluye las carpetas de "ruido" (ver abajo). Por default se filtran.                        |
 | `-h` / `--help`    | —       | Ayuda.                                                                                         |
 
+Comportamiento automático:
+
+- **Color** (`!` rojo, `✓` verde) se aplica **solo si stdout es TTY**. Si lo
+  pipeás a un archivo o a otro comando, sale sin color.
+- **`clear` al inicio** se aplica **solo si stdout es TTY**. Pipeado a `| tee`
+  o `> archivo`, no limpia.
+- **`GIT_TERMINAL_PROMPT=0`** se setea automáticamente, así que `--fetch` no
+  queda colgado pidiendo credenciales. Si algún repo falla por auth, se
+  loguea al final: `fetch: 28 ok · 2 fallaron`.
+
 ### Qué significa cada ícono
 
 | Ícono | Significa                                                        |
@@ -137,15 +147,17 @@ Si querés agregar más exclusiones, abrí un issue o modificá la variable
 `mgitstatus` es excelente y más detallado (sabe de worktrees, submodules,
 diverged, stash...), pero:
 
-| Cosa                      | `mgitstatus` solo  | `git-verify`                                                |
-| ------------------------- | ------------------ | ----------------------------------------------------------- |
-| Detección automática      | Sí (con `-r`)      | Sí (siempre)                                                |
-| Filtro GitHub             | **No**             | **Sí**                                                      |
-| Diferencia GH / no-GH     | No (mezcla todo)   | Sí, en secciones separadas                                  |
-| Branch + remote por repo  | No                 | Sí                                                          |
-| Detalle fino (stash etc.) | Sí                 | Sí, con `--detailed`                                        |
-| Fetch automático          | Manual (`-f`)      | Manual (`--fetch`); solo se aplica a los GH en `--detailed` |
-| Exit code "hay cambios"   | **No** (siempre 0) | Tampoco (heredado de mgitstatus)                            |
+| Cosa                      | `mgitstatus` solo  | `git-verify`                                            |
+| ------------------------- | ------------------ | ------------------------------------------------------- |
+| Detección automática      | Sí (con `-r`)      | Sí (siempre)                                            |
+| Filtro GitHub             | **No**             | **Sí**                                                  |
+| Diferencia GH / no-GH     | No (mezcla todo)   | Sí, en secciones separadas                              |
+| Branch + remote por repo  | No                 | Sí (compacto, branch solo si no es estándar)            |
+| Output summary con conteo | No                 | Sí ("30 repos · 14 con cambios")                        |
+| Detalle fino (stash etc.) | Sí                 | Sí, con `--detailed`                                    |
+| Fetch tolera fallos auth  | **No** (se cuelga) | **Sí** (GIT_TERMINAL_PROMPT=0, loguea los que fallaron) |
+| Clear / color en TTY      | No                 | Sí (TTY-aware, no rompe pipes)                          |
+| Exit code "hay cambios"   | **No** (siempre 0) | Tampoco (parseá stdout si lo necesitás en scripts)      |
 
 `git-verify` es lectura + info clara. Para actuar, vas al repo y hacés lo tuyo.
 

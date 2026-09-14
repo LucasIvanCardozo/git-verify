@@ -509,39 +509,52 @@ select_pull_targets() {
 
   local -a selected_paths=()
 
-  if command -v gum >/dev/null 2>&1 && [[ -t 1 ]]; then
-    # --- UX con gum ---
+  # Decidir UNA vez si podemos usar gum. Necesitamos:
+  #   - gum instalado
+  #   - stdout sea TTY real
+  #   - /dev/tty accesible (algunos entornos restringidos — VSCode,
+  #     paneles de tmux con permisos raros, ssh sin -t, etc. — tienen
+  #     stdout TTY pero gum no puede abrir /dev/tty y se queda colgado)
+  local use_gum=0
+  if command -v gum >/dev/null 2>&1 && [[ -t 1 ]] \
+     && [[ -e /dev/tty && -r /dev/tty && -w /dev/tty ]]; then
+    use_gum=1
+  fi
+
+  if [[ "${#labels[@]}" -eq 1 ]]; then
+    # Único candidato: no abrimos selector, solo pedimos Enter.
+    # Aplica tanto para gum como para bash puro (con 1 solo item no tiene
+    # sentido abrir TUI).
+    printf '\n%sHay 1 repo candidato para pull:%s\n' "$C_BOLD" "$C_RESET" >&2
+    printf '  • %s\n' "${labels[0]}" >&2
+    printf '\n%sEnter para hacer pull, Ctrl-C para cancelar: %s' "$C_DIM" "$C_RESET" >&2
+    local _
+    read -r _ || { return 1; }
+    selected_paths=("${items[0]}")
+  elif [[ "$use_gum" -eq 1 ]]; then
+    # --- UX con gum, con timeout defensivo ---
+    # timeout 60s: si gum se cuelga (raro), matamos el proceso y caemos al
+    # bash puro en lugar de dejar al usuario mirando una pantalla muerta.
     local picked_str
-    if [[ "${#labels[@]}" -eq 1 ]]; then
-      # Único candidato: lo auto-marcamos y pedimos Enter para confirmar.
-      # Toda la UI a stderr para no contaminar el stdout (que captura paths).
-      printf '\n%sHay 1 repo candidato para pull:%s\n' "$C_BOLD" "$C_RESET" >&2
-      printf '  • %s\n' "${labels[0]}" >&2
-      printf '\n%sEnter para hacer pull, Ctrl-C para cancelar: %s' "$C_DIM" "$C_RESET" >&2
-      local _
-      read -r _ || { return 1; }
-      selected_paths=("${items[0]}")
-    else
-      picked_str="$(gum choose --no-limit \
-        --header "Seleccioná repos para hacer pull (espacio=toggle, enter=OK)" \
-        --cursor-prefix " → " \
-        --selected-prefix " ✓ " \
-        "${labels[@]}" 2>/dev/null || true)"
-      [[ -z "$picked_str" ]] && return 1
-      local line
-      while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        # line = "name | N behind"
-        local pname="${line%% | *}"
-        local i
-        for i in "${!labels[@]}"; do
-          if [[ "${labels[$i]%% | *}" == "$pname" ]]; then
-            selected_paths+=("${items[$i]}")
-            break
-          fi
-        done
-      done <<<"$picked_str"
-    fi
+    picked_str="$(timeout 60 gum choose --no-limit \
+      --header "Seleccioná repos para hacer pull (espacio=toggle, enter=OK)" \
+      --cursor-prefix " → " \
+      --selected-prefix " ✓ " \
+      "${labels[@]}" 2>/dev/null || true)"
+    [[ -z "$picked_str" ]] && return 1
+    local line
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      # line = "name | N behind"
+      local pname="${line%% | *}"
+      local i
+      for i in "${!labels[@]}"; do
+        if [[ "${labels[$i]%% | *}" == "$pname" ]]; then
+          selected_paths+=("${items[$i]}")
+          break
+        fi
+      done
+    done <<<"$picked_str"
   else
     # --- UX bash puro ---
     # Toda la UI va a stderr (&2) para no contaminar el stdout que el caller

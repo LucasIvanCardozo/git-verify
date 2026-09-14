@@ -48,7 +48,79 @@ else
   C_RESET=""
 fi
 
+# Progreso (spinner + ETA) solo si stdout es TTY.
+PROGRESS_ENABLED=0
+SPIN_CHARS=""
+SPIN_IDX=0
+PROGRESS_START_S=0
+
 # -------- Helpers --------
+# Inicializa el sistema de progreso (spinner + ETA). No-op si no es TTY.
+progress_init() {
+  PROGRESS_START_S=$SECONDS
+  if [[ ! -t 1 ]]; then
+    PROGRESS_ENABLED=0
+    return 0
+  fi
+  PROGRESS_ENABLED=1
+  SPIN_IDX=0
+  # Braille Unicode si la terminal lo soporta, si no ASCII clásico.
+  if (locale charmap 2>/dev/null || echo UTF-8) | grep -qi 'utf'; then
+    SPIN_CHARS="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+  else
+    SPIN_CHARS='/-\|'
+  fi
+}
+
+# Imprime línea de progreso in-place con \r.
+# Args: current total label item_name
+progress() {
+  local current=$1 total=$2 label=$3 item=$4
+  if [[ "$PROGRESS_ENABLED" -ne 1 ]]; then
+    return 0
+  fi
+  local ch="${SPIN_CHARS:SPIN_IDX:1}"
+  SPIN_IDX=$(( (SPIN_IDX + 1) % ${#SPIN_CHARS} ))
+
+  # Truncar el nombre del item si fuera muy largo (línea única, no scrollea).
+  local item_short="$item"
+  if [[ "${#item_short}" -gt 30 ]]; then
+    item_short="${item_short:0:27}..."
+  fi
+
+  # ETA: elapsed * (total - current) / current
+  local eta_s=""
+  if [[ "$current" -gt 0 && "$current" -lt "$total" ]]; then
+    local elapsed=$(( SECONDS - PROGRESS_START_S ))
+    local total_est=$(( elapsed * total / current ))
+    local remaining=$(( total_est - elapsed ))
+    if [[ "$remaining" -gt 0 ]]; then
+      if [[ "$remaining" -lt 60 ]]; then
+        eta_s=" ETA~${remaining}s"
+      else
+        local m=$(( remaining / 60 ))
+        local s=$(( remaining % 60 ))
+        eta_s=" ETA~${m}m${s}s"
+      fi
+    fi
+  fi
+
+  printf '\r%s %s [%d/%d] %s%s' \
+    "$ch" "$label" "$current" "$total" "$item_short" "$eta_s"
+}
+
+# Termina la línea de progreso e imprime el summary final.
+# Args: summary_line (ej "✓ gathered 30 repos in 4s")
+progress_end() {
+  local summary="$1"
+  if [[ "$PROGRESS_ENABLED" -eq 1 ]]; then
+    printf '\r%*s\r' 100 ""  # limpiar línea (100 spaces)
+    printf '%s\n' "$summary"
+  else
+    printf '%s\n' "$summary"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 git-verify - Lista repos git, separando los de GitHub del resto
@@ -365,11 +437,19 @@ fi
 # -------- Optional fetch (con tolerancia) --------
 declare -a FETCH_FAILURES=()
 if [[ "$DO_FETCH" -eq 1 ]]; then
+  fetch_total=${#ALL_REPOS[@]}
+  progress_init
+  i=0
   for repo in "${ALL_REPOS[@]}"; do
+    i=$((i + 1))
+    progress "$i" "$fetch_total" "fetching" "$(basename "$repo")"
     if ! git -C "$repo" fetch --quiet 2>/dev/null; then
       FETCH_FAILURES+=("$repo")
     fi
   done
+  # Limpia la línea de progreso (clear va a barrer igual; pero por si el
+  # usuario pipea a algo, dejamos la línea en blanco).
+  progress_end ""
 fi
 
 # -------- Categorizar + gather --------
@@ -385,7 +465,12 @@ gh_clean_count=0
 other_dirty_count=0
 other_clean_count=0
 
+gather_total=${#ALL_REPOS[@]}
+progress_init
+i=0
 for repo in "${ALL_REPOS[@]}"; do
+  i=$((i + 1))
+  progress "$i" "$gather_total" "gathering" "$(basename "$repo")"
   csv="$(gather_repo_info "$repo")"
   IFS='|' read -r _ _ _ is_clean _ _ _ _ _ <<<"$csv"
 
@@ -410,6 +495,7 @@ for repo in "${ALL_REPOS[@]}"; do
     fi
   fi
 done
+progress_end ""  # limpia la línea de progreso (el clear va a barrer igual)
 
 # -------- Clear visual (solo TTY) --------
 [[ -t 1 ]] && clear

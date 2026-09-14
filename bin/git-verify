@@ -105,7 +105,7 @@ progress() {
     fi
   fi
 
-  printf '\r%s %s [%d/%d] %s%s' \
+  printf '\r\033[K%s %s [%d/%d] %s%s' \
     "$ch" "$label" "$current" "$total" "$item_short" "$eta_s"
 }
 
@@ -114,10 +114,10 @@ progress() {
 progress_end() {
   local summary="$1"
   if [[ "$PROGRESS_ENABLED" -eq 1 ]]; then
-    printf '\r%*s\r' 100 ""  # limpiar línea (100 spaces)
-    printf '%s\n' "$summary"
+    printf '\r\033[K%*s\r\033[K' 120 ""
+    [[ -n "$summary" ]] && printf '%s\n' "$summary"
   else
-    printf '%s\n' "$summary"
+    [[ -n "$summary" ]] && printf '%s\n' "$summary"
   fi
 }
 

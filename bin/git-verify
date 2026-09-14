@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# git-verify - Lista los repos de GitHub con cambios pendientes bajo un árbol
-# de directorios. Detecta uncommitted changes, untracked files, unpushed
-# commits y commits pendientes de pull. Read-only por default.
+# git-verify - Escanea un árbol de directorios y lista los repos git que
+# encuentra, separando los que apuntan a GitHub de los que apuntan a otros
+# remotes. Para cada repo muestra info útil: branch, remote y estado de
+# cambios.
 #
-# Es un wrapper sobre mgitstatus:
+# Sin dependencias obligatorias más allá de bash, git y find. `mgitstatus`
+# solo es necesario si usás --detailed.
+#
 #   https://github.com/fboender/multi-git-status
-#
-# Filtramos los repos cuyo remoto apunte a github.com (case-insensitive) y
-# le pasamos solo esos a mgitstatus, que hace el chequeo fino por repo.
 
 set -euo pipefail
 
@@ -16,12 +16,13 @@ set -euo pipefail
 SCAN_DIR="$HOME"
 DEPTH=2
 DO_FETCH=0
-EXCLUDE_OK=1   # default: solo repos con cambios pendientes
+ONLY_PENDING=0
+SHOW_DETAILED=0
 
 # -------- Helpers --------
 usage() {
   cat <<'EOF'
-git-verify - Lista repos de GitHub con cambios pendientes
+git-verify - Lista repos git, separando los de GitHub del resto
 
 Uso:
   git-verify [OPCIONES] [DIRECTORIO]
@@ -30,91 +31,169 @@ Argumentos:
   DIRECTORIO         Raíz a escanear. Default: $HOME
 
 Opciones:
-  -d, --depth N      Profundidad máxima de búsqueda (default: 2; 0 = sin límite).
-                     Nota: cuenta el directorio de partida. -d 2 encuentra
-                     repos hasta 'raiz/<algo>/.git'.
-      --fetch         Hace 'git fetch --quiet' antes de chequear, para que
-                      "needs pull" sea preciso. Toca cada remote.
-      --all           Muestra también los repos OK (sin cambios pendientes).
+  -d, --depth N      Profundidad máxima (default: 2; 0 = sin límite).
+                     Cuenta el dir de partida: raiz/<x>/.git = 2.
+      --fetch         Hace 'git fetch --quiet' antes de chequear. Toca
+                      cada remote. Hace que "needs pull" sea preciso.
+      --only-pending  Oculta los repos clean. Default: muestra todos.
+      --detailed      Al final, llama a mgitstatus para info detallada de
+                      los repos GitHub. Necesita mgitstatus instalado.
   -h, --help         Esta ayuda.
 
 Dependencias:
-  bash, git, find y mgitstatus (https://github.com/fboender/multi-git-status)
-
-Ejemplos:
-  git-verify                              # escanea $HOME, depth 2, sin fetch
-  git-verify --fetch                     # igual pero con fetch previo
-  git-verify ~/proyectos                  # otra raíz
-  git-verify -d 4 --fetch ~/code          # profundidad 4 + fetch
-  git-verify -d 0 ~/proyectos             # sin límite de profundidad
+  bash, git, find   (mgitstatus solo es obligatorio con --detailed)
 EOF
 }
 
 err() { echo "Error: $*" >&2; }
 
-# Devuelve 0 (verdadero) si algún remote del repo apunta a github.com.
+# Devuelve 0 si algún remote del repo apunta a github.com (case-insensitive).
 is_github_repo() {
-  local repo="$1"
-  local remote url
+  local repo="$1" remote url
   while IFS= read -r remote; do
     [[ -z "$remote" ]] && continue
     url="$(git -C "$repo" config --get "remote.$remote.url" 2>/dev/null || true)"
-    if [[ -n "$url" ]] && echo "$url" | grep -qi "github.com"; then
+    if [[ -n "$url" ]] && echo "$url" | grep -qi 'github.com'; then
       return 0
     fi
-  done < <(git -C "$repo" remote 2>/dev/null)
+  done < <(git -C "$repo" remote 2>/dev/null || true)
   return 1
+}
+
+# Imprime una línea CSV (separada por '|') con info del repo.
+# Campos: path|branch|remote|is_clean|staged|unstaged|untracked|has_upstream|is_bare
+gather_repo_info() {
+  local repo="$1"
+  local branch="" remote_url="" staged=0 unstaged=0 untracked=0 upstream="" has_up=0 is_bare=0 is_clean=1
+
+  # Bare repos los detectamos y etiquetamos (no tienen working dir).
+  if [[ "$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null || echo false)" == "true" ]]; then
+    is_bare=1
+  fi
+
+  if [[ "$is_bare" -eq 0 ]]; then
+    branch="$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null || true)"
+    if [[ -z "$branch" ]]; then
+      # Detached HEAD: mostramos hash corto con prefijo para distinguirlo.
+      local _hash
+      _hash="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+      branch="detached:$_hash"
+    fi
+    # Truncamos si fuera muy largo para mantener la línea legible.
+    if [[ "${#branch}" -gt 24 ]]; then
+      branch="${branch:0:21}..."
+    fi
+
+    remote_url="$(git -C "$repo" config --get remote.origin.url 2>/dev/null || true)"
+    if [[ -z "$remote_url" ]]; then
+      local first_remote
+      first_remote="$(git -C "$repo" remote 2>/dev/null | head -1 || true)"
+      if [[ -n "$first_remote" ]]; then
+        remote_url="$(git -C "$repo" config --get "remote.$first_remote.url" 2>/dev/null || true)"
+      fi
+    fi
+    remote_url="${remote_url:-"(sin remote)"}"
+
+    staged="$(git -C "$repo" diff --cached --name-only 2>/dev/null | wc -l || echo 0)"
+    unstaged="$(git -C "$repo" diff --name-only 2>/dev/null | wc -l || echo 0)"
+    untracked="$(git -C "$repo" ls-files --others --exclude-standard 2>/dev/null | wc -l || echo 0)"
+    if [[ "$staged" -eq 0 && "$unstaged" -eq 0 && "$untracked" -eq 0 ]]; then
+      is_clean=1
+    else
+      is_clean=0
+    fi
+
+    upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+    [[ -n "$upstream" ]] && has_up=1
+  else
+    branch="(bare)"
+    remote_url="(bare)"
+  fi
+
+  printf '%s\n' "${repo}|${branch}|${remote_url}|${is_clean}|${staged}|${unstaged}|${untracked}|${has_up}|${is_bare}"
+}
+
+# Path relativo a SCAN_DIR para display; usa basename si quedan en ".".
+relative_path() {
+  local repo="$1"
+  local rel
+  rel="$(realpath --relative-to="$SCAN_DIR" "$repo" 2>/dev/null || true)"
+  if [[ -z "$rel" || "$rel" == "." ]]; then
+    rel="$(basename "$repo")"
+  fi
+  echo "$rel"
+}
+
+# Imprime la línea principal de un repo: icono + path + (branch) + remote.
+print_repo_line() {
+  local csv="$1" rel="$2"
+  IFS='|' read -r _path branch remote is_clean _ _ _ _ is_bare <<<"$csv"
+  if [[ "$is_bare" == "1" ]]; then
+    printf '  - %-40s [bare]\n' "$rel"
+    return
+  fi
+  local icon="✓"
+  [[ "$is_clean" == "1" ]] || icon="!"
+  printf '  %s %-40s  (%s)  %s\n' "$icon" "$rel" "$branch" "$remote"
+}
+
+# Imprime la sublínea con detalle de cambios si está sucio.
+print_repo_status() {
+  local csv="$1"
+  IFS='|' read -r _ _ _ is_clean staged unstaged untracked has_up is_bare <<<"$csv"
+  [[ "$is_clean" == "1" || "$is_bare" == "1" ]] && return
+  local parts=()
+  [[ "$staged"    -gt 0 ]] && parts+=("staged:$staged")
+  [[ "$unstaged"  -gt 0 ]] && parts+=("unstaged:$unstaged")
+  [[ "$untracked" -gt 0 ]] && parts+=("untracked:$untracked")
+  [[ "$has_up"    == "0" ]] && parts+=("needs upstream")
+  [[ "${#parts[@]}" -eq 0 ]] && parts+=("dirty")
+  local joined
+  joined="$(IFS=' · '; echo "${parts[*]}")"
+  printf '       └─ %s\n' "$joined"
 }
 
 # -------- Parseo de argumentos --------
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help)        usage; exit 0 ;;
-    -d|--depth)       [[ $# -ge 2 ]] || { err "falta valor para $1"; exit 2; }
-                      DEPTH="$2"; shift 2 ;;
-    --depth=*)        DEPTH="${1#*=}"; shift ;;
-    --fetch)          DO_FETCH=1; shift ;;
-    --all)            EXCLUDE_OK=0; shift ;;
-    --)               shift; while [[ $# -gt 0 ]]; do ARGS+=("$1"); shift; done ;;
-    -*)               err "opción desconocida: $1"; usage; exit 2 ;;
-    *)                ARGS+=("$1"); shift ;;
+    -h|--help)         usage; exit 0 ;;
+    -d|--depth)
+      [[ $# -ge 2 ]] || { err "falta valor para $1"; exit 2; }
+      DEPTH="$2"; shift 2 ;;
+    --depth=*)         DEPTH="${1#*=}"; shift ;;
+    --fetch)           DO_FETCH=1; shift ;;
+    --only-pending)    ONLY_PENDING=1; shift ;;
+    --detailed)        SHOW_DETAILED=1; shift ;;
+    --)                shift; while [[ $# -gt 0 ]]; do ARGS+=("$1"); shift; done ;;
+    -*)                err "opción desconocida: $1"; usage; exit 2 ;;
+    *)                 ARGS+=("$1"); shift ;;
   esac
 done
 
-if [[ ${#ARGS[@]} -gt 0 ]]; then
+if [[ "${#ARGS[@]}" -gt 0 ]]; then
   SCAN_DIR="${ARGS[0]}"
 fi
 
 # -------- Validaciones --------
-if [[ ! -d "$SCAN_DIR" ]]; then
-  err "'$SCAN_DIR' no existe o no es un directorio."
-  exit 2
-fi
+[[ -d "$SCAN_DIR" ]] || { err "'$SCAN_DIR' no existe o no es un directorio."; exit 2; }
 
-if ! command -v mgitstatus >/dev/null 2>&1; then
+if [[ "$SHOW_DETAILED" -eq 1 ]] && ! command -v mgitstatus >/dev/null 2>&1; then
   cat >&2 <<'EOF'
-mgitstatus no está instalado.
+mgitstatus no está instalado (solo es obligatorio con --detailed).
 
-Es la dependencia que hace el chequeo fino por repo. Para instalarlo:
+Para instalarlo:
 
   git clone https://github.com/fboender/multi-git-status.git
   cd multi-git-status
-  make install                              # global (requiere sudo)
-  # o, sin sudo, solo para tu usuario:
+  make install                              # global (con sudo)
+  # o sin sudo, solo para tu usuario:
   PREFIX=~/.local make install
-
-Más info: https://github.com/fboender/multi-git-status
 EOF
   exit 127
 fi
 
 # -------- Descubrir repos --------
-# find con -name .git + prune: solo entra a .git (no a sus subdirs).
-# Silenciamos errores de permisos con 2>/dev/null.
-# find -maxdepth cuenta desde el directorio pasado: -maxdepth 2 matchea
-# raiz/.git, raiz/<algo>, raiz/<algo>/.git. Para "sin límite" no pasamos
-# -maxdepth (DEPTH=0); para valores >0 lo usamos como techo.
 if [[ "$DEPTH" -eq 0 ]]; then
   FIND_ARGS=()
 else
@@ -126,50 +205,92 @@ mapfile -t ALL_REPOS < <(
     | sed 's|/\.git$||' | sort -u
 )
 
-if [[ ${#ALL_REPOS[@]} -eq 0 ]]; then
+if [[ "${#ALL_REPOS[@]}" -eq 0 ]]; then
   echo "No se encontraron repositorios git en '$SCAN_DIR' (depth=$DEPTH)."
   exit 0
 fi
 
-# -------- Filtrar por GitHub --------
-GH_REPOS=()
-NON_GH=0
-for repo in "${ALL_REPOS[@]}"; do
-  if is_github_repo "$repo"; then
-    GH_REPOS+=("$repo")
-  else
-    NON_GH=$((NON_GH + 1))
-  fi
-done
-
-if [[ ${#GH_REPOS[@]} -eq 0 ]]; then
-  echo "Repos git encontrados: ${#ALL_REPOS[@]} en '$SCAN_DIR' (depth=$DEPTH)."
-  echo "Ninguno apunta a github.com (¿están bien configurados los remotes?)."
-  exit 0
-fi
-
-# -------- Header --------
-echo "Escaneados: ${#ALL_REPOS[@]} | GitHub: ${#GH_REPOS[@]} | Otros: $NON_GH"
-echo "Directorio: $SCAN_DIR (depth=$DEPTH)"
+# -------- Optional fetch --------
 if [[ "$DO_FETCH" -eq 1 ]]; then
-  echo "Fetch: activado (puede ser lento si hay muchos remotes)"
-fi
-echo "----------------------------------------"
-
-# -------- Fetch opcional --------
-if [[ "$DO_FETCH" -eq 1 ]]; then
-  for repo in "${GH_REPOS[@]}"; do
-    # Toleramos errores individuales (sin red, sin credenciales, etc.)
+  for repo in "${ALL_REPOS[@]}"; do
     git -C "$repo" fetch --quiet 2>/dev/null || true
   done
 fi
 
-# -------- Pasamanos a mgitstatus --------
-MGIT_ARGS=()
-[[ "$EXCLUDE_OK" -eq 1 ]] && MGIT_ARGS+=(-e)
-# Nota: si DO_FETCH=1 ya hicimos fetch nosotros, así que NO pasamos -f a
-# mgitstatus (evita doble pasada por cada remote).
+# -------- Categorizar + gather --------
+declare -a GH_INFO=()
+declare -a OTHER_INFO=()
+declare -a GH_PATHS=()       # paths originales para --detailed
+gh_total=0
+other_total=0
 
-# Sin flag paralelo confiable: simplemente invocamos.
-# exec para que el exit code de mgitstatus sea el de git-verify (útil en CI/scripts).
-exec mgitstatus "${MGIT_ARGS[@]}" "${GH_REPOS[@]}"
+for repo in "${ALL_REPOS[@]}"; do
+  if is_github_repo "$repo"; then
+    gh_total=$((gh_total + 1))
+    csv="$(gather_repo_info "$repo")"
+    if [[ "$ONLY_PENDING" -eq 1 ]]; then
+      IFS='|' read -r _ _ _ is_clean _ _ _ _ _ <<<"$csv"
+      [[ "$is_clean" == "1" ]] && continue
+    fi
+    GH_INFO+=("$csv")
+    GH_PATHS+=("$repo")
+  else
+    other_total=$((other_total + 1))
+    csv="$(gather_repo_info "$repo")"
+    if [[ "$ONLY_PENDING" -eq 1 ]]; then
+      IFS='|' read -r _ _ _ is_clean _ _ _ _ _ <<<"$csv"
+      [[ "$is_clean" == "1" ]] && continue
+    fi
+    OTHER_INFO+=("$csv")
+  fi
+done
+
+# -------- Header --------
+echo "git-verify — $SCAN_DIR (depth=$DEPTH)"
+echo "${#ALL_REPOS[@]} repos | $gh_total en GitHub | $other_total en otros remotes"
+[[ "$DO_FETCH" -eq 1 ]]     && echo "fetch activado · tocando cada remote"
+[[ "$ONLY_PENDING" -eq 1 ]] && echo "filtro: solo pendientes"
+echo ""
+
+# -------- Sección GitHub --------
+printf 'GitHub (%d)\n' "$gh_total"
+printf -- '----------------------------------------\n'
+if [[ "$gh_total" -eq 0 ]]; then
+  echo "  (no se encontraron repos con remote en github.com)"
+elif [[ "${#GH_INFO[@]}" -eq 0 ]]; then
+  echo "  (todos clean con --only-pending)"
+else
+  for csv in "${GH_INFO[@]}"; do
+    rel="$(relative_path "${csv%%|*}")"
+    print_repo_line "$csv" "$rel"
+    print_repo_status "$csv"
+  done
+fi
+echo ""
+
+# -------- Sección Otros --------
+printf 'Otros remotes (%d)\n' "$other_total"
+printf -- '----------------------------------------\n'
+if [[ "$other_total" -eq 0 ]]; then
+  echo "  (todos los repos apuntan a github.com, o no tienen remote)"
+elif [[ "${#OTHER_INFO[@]}" -eq 0 ]]; then
+  echo "  (todos clean con --only-pending)"
+else
+  for csv in "${OTHER_INFO[@]}"; do
+    rel="$(relative_path "${csv%%|*}")"
+    print_repo_line "$csv" "$rel"
+    print_repo_status "$csv"
+  done
+fi
+
+# -------- Sección detallada (opcional) --------
+if [[ "$SHOW_DETAILED" -eq 1 && "${#GH_PATHS[@]}" -gt 0 ]]; then
+  echo ""
+  echo "Detalle de GitHub (mgitstatus)"
+  echo "----------------------------------------"
+  if [[ "$ONLY_PENDING" -eq 1 ]]; then
+    mgitstatus -e "${GH_PATHS[@]}" 2>/dev/null || true
+  else
+    mgitstatus "${GH_PATHS[@]}" 2>/dev/null || true
+  fi
+fi

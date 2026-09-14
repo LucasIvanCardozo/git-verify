@@ -23,6 +23,11 @@ ONLY_PENDING=0
 SHOW_DETAILED=0
 EXCLUDE_NOISE=1
 FETCH_PARALLEL=4  # Fetch paralelo: default 4, máximo 16. 1 = serial (--no-parallel).
+DO_PULL=0
+PULL_FF_ONLY=1    # Default seguro: solo fast-forward. Override con --rebase o --no-ff-only.
+PULL_REBASE=0
+# Si --pull, fetch se activa implícitamente (lo marcamos acá y lo aplicamos
+# despues de parsear args, en el bloque de auto-fetch).
 
 # Paths que casi nunca son "proyectos tuyos" pero contienen .git dirs.
 NOISE_DIRS=(
@@ -203,6 +208,15 @@ Opciones:
                       satura). En modo paralelo el progress muestra
                       solo el contador global, no el item actual.
       --no-parallel   Desactiva el paralelismo de --fetch (forza serial).
+      --pull          Después del render, deja elegir de entre los repos
+                      con `!` cuáles hacer `git pull` (solo los que
+                      pueden: behind > 0, working tree limpio, sin
+                      divergencia). Activa fetch implícito. Default:
+                      `git pull --ff-only` (no destructivo).
+      --rebase        Con --pull, usa `git pull --rebase` en vez de
+                      --ff-only. Reescribe tu historia local.
+      --no-ff-only    Con --pull, usa `git pull` clásico (merge commit).
+                      Menos seguro para scripts automáticos.
       --only-pending  Oculta los repos clean. Default: muestra todos.
       --detailed      Al final, llama a mgitstatus para info detallada
                       de los repos GitHub. Necesita mgitstatus instalado.
@@ -211,7 +225,9 @@ Opciones:
   -h, --help         Esta ayuda.
 
 Dependencias:
-  bash, git, find   (mgitstatus solo es obligatorio con --detailed)
+  bash, git, find   (mgitstatus solo es obligatorio con --detailed,
+                      gum solo si querés TUI bonita en --pull; sin gum
+                      usa selector bash puro)
 
 Carpetas de ruido excluidas por default:
   ~/.cache, ~/.local/share/Trash, ~/.nvm, ~/.pi/agent
@@ -450,6 +466,282 @@ render_section() {
   echo ""
 }
 
+# -------- Pull phase (--pull) --------
+
+# Filtra candidatos a pull. Un repo es candidato si:
+#   - tiene upstream, no es bare, no es detached
+#   - tiene behind > 0
+#   - NO tiene ahead (divergente) — eso requiere --rebase manual
+#   - working tree limpio (sin staged/unstaged/untracked)
+# Lee los CSVs de los arrays globales GH_DIRTY/OTHER_DIRTY (los clean no
+# pueden tener behind > 0 por la condición de is_clean).
+# Poblamos PULL_CANDIDATES como array global de CSVs.
+gather_pull_candidates() {
+  PULL_CANDIDATES=()
+  local csv
+  for csv in "${GH_DIRTY[@]}" "${OTHER_DIRTY[@]}"; do
+    local path staged unstaged untracked has_up is_bare ahead behind
+    IFS='|' read -r path _ _ _ staged unstaged untracked has_up is_bare ahead behind <<<"$csv"
+    if [[ "$behind" -gt 0 && "$ahead" -eq 0 \
+       && "$staged" -eq 0 && "$unstaged" -eq 0 && "$untracked" -eq 0 \
+       && "$has_up" -eq 1 && "$is_bare" -ne 1 ]]; then
+      PULL_CANDIDATES+=("$csv")
+    fi
+  done
+}
+
+# Muestra TUI para elegir repos. Auto-detecta gum:
+#   - si está: gum choose --no-limit, devuelve labels seleccionados
+#   - si no: bash puro con números
+# Argumentos: ninguno. Lee PULL_CANDIDATES.
+# Devuelve por stdout una lista de paths newline-separated.
+# Exit codes: 0 si hay selección, 1 si cancelado / inválido.
+select_pull_targets() {
+  local -a items=() labels=()
+  local csv path name behind
+  for csv in "${PULL_CANDIDATES[@]}"; do
+    path="${csv%%|*}"
+    name="$(basename "$path")"
+    IFS='|' read -r _ _ _ _ _ _ _ _ _ _ behind <<<"$csv"
+    items+=("$path")
+    labels+=("$name | $behind behind")
+  done
+
+  local -a selected_paths=()
+
+  if command -v gum >/dev/null 2>&1 && [[ -t 1 ]]; then
+    # --- UX con gum ---
+    local picked_str
+    if [[ "${#labels[@]}" -eq 1 ]]; then
+      # Único candidato: lo auto-marcamos y pedimos Enter para confirmar.
+      # Toda la UI a stderr para no contaminar el stdout (que captura paths).
+      printf '\n%sHay 1 repo candidato para pull:%s\n' "$C_BOLD" "$C_RESET" >&2
+      printf '  • %s\n' "${labels[0]}" >&2
+      printf '\n%sEnter para hacer pull, Ctrl-C para cancelar: %s' "$C_DIM" "$C_RESET" >&2
+      local _
+      read -r _ || { return 1; }
+      selected_paths=("${items[0]}")
+    else
+      picked_str="$(gum choose --no-limit \
+        --header "Seleccioná repos para hacer pull (espacio=toggle, enter=OK)" \
+        --cursor-prefix " → " \
+        --selected-prefix " ✓ " \
+        "${labels[@]}" 2>/dev/null || true)"
+      [[ -z "$picked_str" ]] && return 1
+      local line
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # line = "name | N behind"
+        local pname="${line%% | *}"
+        local i
+        for i in "${!labels[@]}"; do
+          if [[ "${labels[$i]%% | *}" == "$pname" ]]; then
+            selected_paths+=("${items[$i]}")
+            break
+          fi
+        done
+      done <<<"$picked_str"
+    fi
+  else
+    # --- UX bash puro ---
+    # Toda la UI va a stderr (&2) para no contaminar el stdout que el caller
+    # redirige al tmpfile con los paths seleccionados.
+    printf '\n%sRepos disponibles para pull:%s\n' "$C_BOLD" "$C_RESET" >&2
+    printf '%s%s%s\n' "$C_DIM" "------------------------------------------------------------" "$C_RESET" >&2
+    local i
+    for i in "${!labels[@]}"; do
+      printf '  %s[%d]%s %s\n' "$C_DIM" "$((i+1))" "$C_RESET" "${labels[$i]}" >&2
+    done
+    printf '\n%sSeleccioná (ej: 1,3  o  1-3  o  all  o  q para salir): %s' "$C_DIM" "$C_RESET" >&2
+    local sel
+    read -r sel || sel=""
+    case "${sel,,}" in
+      ""|q|quit|n|no) return 1 ;;
+      all|a)
+        selected_paths=("${items[@]}")
+        ;;
+      *)
+        # Parsear "1,3,5-7" → expandimos a [1,3,5,6,7]
+        local -a picks=()
+        local token part lo hi n
+        IFS=',' read -ra parts <<<"$sel"
+        for part in "${parts[@]}"; do
+          part="${part// /}"  # trim spaces
+          [[ -z "$part" ]] && continue
+          if [[ "$part" == *-* ]]; then
+            lo="${part%-*}"; hi="${part#*-}"
+            for ((n=lo; n<=hi; n++)); do
+              [[ "$n" -ge 1 && "$n" -le "${#items[@]}" ]] && picks+=("$n")
+            done
+          elif [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le "${#items[@]}" ]]; then
+            picks+=("$part")
+          else
+            printf '%s  (ignorando "%s")\n%s' "$C_DIM" "$part" "$C_RESET" >&2
+          fi
+        done
+        # Deduplicar y mapear a paths
+        local seen="" p
+        for p in "${picks[@]}"; do
+          if [[ ",$seen," != *",$p,"* ]]; then
+            seen="${seen:+$seen,}$p"
+            selected_paths+=("${items[$((p-1))]}")
+          fi
+        done
+        ;;
+    esac
+  fi
+
+  [[ "${#selected_paths[@]}" -gt 0 ]] || return 1
+  printf '%s\n' "${selected_paths[@]}"
+}
+
+# Pide confirmación. Argumentos: $1=desc_cmd, $2..$N=paths.
+# Devuelve 0 si 'y', 1 si no.
+confirm_pull() {
+  local cmd_desc="$1"; shift
+  local -a targets=("$@")
+  printf '\n%sVoy a hacer `%s` en %d repos:%s\n' \
+    "$C_BOLD" "$cmd_desc" "${#targets[@]}" "$C_RESET"
+  local t
+  for t in "${targets[@]}"; do
+    printf '  %s•%s %s\n' "$C_DIM" "$C_RESET" "$(basename "$t")"
+  done
+  printf '\n%s¿Continuar? [y/N] %s' "$C_BOLD" "$C_RESET"
+  local ans
+  read -r ans || ans=""
+  case "${ans,,}" in
+    y|yes|s|si|sí) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Ejecuta git pull en un repo.
+# $1=repo, $2=pull_cmd (ej "pull --ff-only").
+# stdout: mensaje corto de resultado. exit: 0 ok, 1 fail.
+run_pull_one() {
+  local repo="$1" pull_cmd="$2"
+  local out rc
+  out="$(git -C "$repo" $pull_cmd 2>&1)"
+  rc=$?
+  if [[ $rc -eq 0 ]]; then
+    if echo "$out" | grep -qi "Already up to date"; then
+      printf 'ya estaba al día'
+    else
+      # Resumen de cambios: "N files changed, M insertions(+), K deletions(-)"
+      local summary
+      summary="$(echo "$out" \
+        | grep -E '[0-9]+ files? changed(,)?( [0-9]+ insertions?\(.\))?( [0-9]+ deletions?\(.\))?' \
+        | head -1 | sed 's/^[[:space:]]*//')"
+      if [[ -n "$summary" ]]; then
+        printf 'OK · %s' "$summary"
+      else
+        printf 'OK'
+      fi
+    fi
+    return 0
+  else
+    local reason
+    reason="$(echo "$out" | grep -iE 'fatal|error|not possible|diverged|conflict|couldn' | head -1 | sed 's/^[[:space:]]*//')"
+    [[ -z "$reason" ]] && reason="pull falló (revisá a mano: git -C \"$repo\" status)"
+    printf '%s' "$reason"
+    return 1
+  fi
+}
+
+# Orquesta: candidatos → selección → confirmación → loop pull → resumen.
+pull_phase() {
+  gather_pull_candidates
+  if [[ "${#PULL_CANDIDATES[@]}" -eq 0 ]]; then
+    printf '\n%s--pull: ningún repo es candidato (todos con cambios locales, divergentes o ya al día)%s\n' \
+      "$C_DIM" "$C_RESET"
+    return 0
+  fi
+
+  # Decidir comando
+  local pull_cmd
+  if [[ "$PULL_REBASE" -eq 1 ]]; then
+    pull_cmd="pull --rebase"
+  elif [[ "$PULL_FF_ONLY" -eq 1 ]]; then
+    pull_cmd="pull --ff-only"
+  else
+    pull_cmd="pull"
+  fi
+
+  # Selección
+  local -a selected=()
+  local tmpfile
+  tmpfile="$(mktemp 2>/dev/null || echo "/tmp/gv-pull-sel-$$")"
+  if select_pull_targets > "$tmpfile" 2>/dev/null; then
+    mapfile -t selected < "$tmpfile"
+  fi
+  rm -f "$tmpfile" 2>/dev/null
+
+  if [[ "${#selected[@]}" -eq 0 ]]; then
+    printf '\n%s--pull cancelado o sin selección%s\n' "$C_DIM" "$C_RESET"
+    return 0
+  fi
+
+  # Confirmación
+  if ! confirm_pull "git $pull_cmd" "${selected[@]}"; then
+    printf '\n%sCancelado por el usuario%s\n' "$C_DIM" "$C_RESET"
+    return 0
+  fi
+
+  # Loop
+  printf '\n%s%s%s\n' "$C_BOLD" "Ejecutando pull..." "$C_RESET"
+  printf '%s%s%s\n' "$C_DIM" "------------------------------------------------------------" "$C_RESET"
+
+  local -a pull_ok=() pull_fail=()
+  local repo name result rc i total
+  total=${#selected[@]}
+  i=0
+  for repo in "${selected[@]}"; do
+    i=$((i + 1))
+    name="$(basename "$repo")"
+
+    if [[ -t 1 ]]; then
+      spinner_start "pulling $name..."
+      result="$(run_pull_one "$repo" "$pull_cmd")"
+      rc=$?
+      spinner_stop
+    else
+      result="$(run_pull_one "$repo" "$pull_cmd")"
+      rc=$?
+    fi
+
+    # Ancho fijo para el nombre: tomar el más largo del lote (cap 30)
+    local maxlen=0 this_len
+    local r
+    for r in "${selected[@]}"; do
+      this_len=${#r}
+      [[ $this_len -gt 30 ]] && this_len=30
+      (( this_len > maxlen )) && maxlen=$this_len
+    done
+    local pad=$((maxlen - ${#name})); [[ $pad -lt 1 ]] && pad=1
+    local name_pad="$(printf '%*s' "$pad" '')"
+
+    if [[ $rc -eq 0 ]]; then
+      printf '  %s✓%s %s%s  %s\n' "$C_GREEN" "$C_RESET" "$name" "$name_pad" "$result"
+      pull_ok+=("$repo")
+    else
+      printf '  %s✗%s %s%s  %s\n' "$C_RED" "$C_RESET" "$name" "$name_pad" "$result"
+      pull_fail+=("$repo")
+    fi
+  done
+
+  # Resumen final
+  printf '\n%spull: %d ok · %d fallaron%s\n' \
+    "$C_DIM" "${#pull_ok[@]}" "${#pull_fail[@]}" "$C_RESET"
+
+  if [[ ${#pull_fail[@]} -gt 0 ]]; then
+    printf '%sRepos fallidos (paths):%s\n' "$C_DIM" "$C_RESET"
+    local r
+    for r in "${pull_fail[@]}"; do
+      printf '  %s•%s %s\n' "$C_DIM" "$C_RESET" "$r"
+    done
+  fi
+}
+
 # -------- Parseo de argumentos --------
 ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -469,6 +761,9 @@ while [[ $# -gt 0 ]]; do
                       [[ "$FETCH_PARALLEL" -ge 0 ]] 2>/dev/null || { err "valor inválido para --parallel"; exit 2; }
                       shift ;;
     --no-parallel)     FETCH_PARALLEL=1; shift ;;
+    --pull)            DO_PULL=1; shift ;;
+    --rebase)          PULL_REBASE=1; PULL_FF_ONLY=0; shift ;;
+    --no-ff-only)      PULL_FF_ONLY=0; shift ;;
     --only-pending)    ONLY_PENDING=1; shift ;;
     --detailed)        SHOW_DETAILED=1; shift ;;
     --include-all)     EXCLUDE_NOISE=0; shift ;;
@@ -484,6 +779,11 @@ fi
 
 # -------- Validaciones --------
 [[ -d "$SCAN_DIR" ]] || { err "'$SCAN_DIR' no existe o no es un directorio."; exit 2; }
+
+# --pull implica fetch: si no pasaste --fetch, lo activamos en silencio.
+if [[ "$DO_PULL" -eq 1 && "$DO_FETCH" -eq 0 ]]; then
+  DO_FETCH=1
+fi
 
 if [[ "$SHOW_DETAILED" -eq 1 ]] && ! command -v mgitstatus >/dev/null 2>&1; then
   cat >&2 <<'EOF'
@@ -729,4 +1029,9 @@ if [[ "$SHOW_DETAILED" -eq 1 && "${#GH_PATHS[@]}" -gt 0 ]]; then
   else
     mgitstatus "${GH_PATHS[@]}" 2>/dev/null || true
   fi
+fi
+
+# -------- Pull interactivo (--pull) --------
+if [[ "$DO_PULL" -eq 1 ]]; then
+  pull_phase
 fi

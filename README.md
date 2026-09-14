@@ -80,9 +80,12 @@ ln -s ~/code/git-verify/bin/git-verify ~/.local/bin/git-verify
 git-verify                              # escanea $HOME entero, sin límite, sin fetch
 git-verify --only-pending               # oculta los repos "clean"
 git-verify --fetch                      # hace 'git fetch' antes (necesario para "needs pull" preciso)
-                                           # con 4 fetches en paralelo por default
+                                               # con 4 fetches en paralelo por default
 git-verify --fetch --parallel 8         # 8 fetches simultáneos (max 16)
 git-verify --fetch --no-parallel        # forzar serial (un fetch por vez)
+git-verify --pull                       # después del render, deja elegir repos y hace git pull --ff-only
+git-verify --pull --rebase              # usa git pull --rebase en vez de --ff-only
+git-verify --pull --no-ff-only          # usa git pull clásico (merge commit)
 git-verify --detailed                   # agrega sección detallada de los GH (usa mgitstatus)
 git-verify ~/proyectos                  # escanea otra raíz
 git-verify -d 3 ~/code                  # limita a 3 niveles
@@ -98,6 +101,9 @@ git-verify --help                       # ayuda completa
 | `--fetch`          | off     | Hace `git fetch --quiet` antes. Toca cada remote.                                              |
 | `--parallel N`     | `4`     | Fetches simultáneos (solo con `--fetch`). Default 4, máximo 16. Más no ayuda (red saturada).   |
 | `--no-parallel`    | off     | Desactiva paralelismo, fuerza serial con `--fetch`.                                            |
+| `--pull`           | off     | Después del render, deja elegir de los repos con `!` cuáles hacer `git pull`. Activa fetch.    |
+| `--rebase`         | off     | Con `--pull`: usa `git pull --rebase` en vez del default `--ff-only`. Reescribe historia.      |
+| `--no-ff-only`     | off     | Con `--pull`: usa `git pull` clásico (merge commit). Menos seguro para scripts.                |
 | `--only-pending`   | off     | Oculta los repos clean (cambia el default de "mostrar todos" a "solo problemáticos").          |
 | `--detailed`       | off     | Al final, llama a `mgitstatus` para info detallada de los GH (necesita mgitstatus).            |
 | `--include-all`    | off     | No excluye las carpetas de "ruido" (ver abajo). Por default se filtran.                        |
@@ -120,6 +126,106 @@ Comportamiento automático:
 | `✓`   | Working tree limpio: sin cambios locales, sin commits ahead ni behind.                                               |
 | `!`   | Hay cambios: staged, unstaged, untracked, commits ahead (sin pushear), commits behind (sin pullear), o sin upstream. |
 | `-`   | Repo bare (sin working dir).                                                                                         |
+
+---
+
+## `--pull`: elegir y hacer pull desde el listado
+
+Si pasás `--pull`, después del render normal `git-verify` te deja elegir de
+entre los repos con `!` cuáles hacer pull y lo ejecuta uno por uno (serial).
+Activá fetch automáticamente (no tiene sentido pull sin refs frescas).
+
+### Lo que es candidato a pull
+
+| Condición                                                       | Acción                                     |
+| --------------------------------------------------------------- | ------------------------------------------ |
+| `behind > 0`, `ahead == 0`, working tree limpio, tiene upstream | Aparece en el selector.                    |
+| `behind == 0` (ya al día)                                       | No aparece.                                |
+| `ahead > 0 && behind == 0` (solo ahead)                         | No aparece (no hay nada que pullear).      |
+| `ahead > 0 && behind > 0` (divergente)                          | No aparece (requiere `--rebase` manual).   |
+| Cambios locales sin commitear (staged/unstaged/untracked)       | No aparece (pull podría tener conflictos). |
+| Sin upstream, bare, detached HEAD                               | No aparece.                                |
+
+Si ningún repo es candidato, se avisa y termina sin hacer nada.
+
+### Selector
+
+- Si tenés **gum** instalado y stdout es TTY: TUI con checkboxes, `espacio`
+  para toggle, `enter` para confirmar, `esc` para cancelar.
+- Sin gum o sin TTY (pipe, cron, etc.): selector bash puro. Ingresás
+  números: `1,3`, `1-3`, `all`, `q` para salir.
+
+Con un solo candidato, se auto-selecciona y solo pide Enter para confirmar.
+
+### Estrategia de merge (default `--ff-only`)
+
+| Flag                  | Comando emitido      | Cuándo usarlo                                              |
+| --------------------- | -------------------- | ---------------------------------------------------------- |
+| `--pull`              | `git pull --ff-only` | Default. Solo si es fast-forward. Sino aborta ese repo.    |
+| `--pull --rebase`     | `git pull --rebase`  | Si querés reaplicar tus commits locales arriba del remoto. |
+| `--pull --no-ff-only` | `git pull`           | Merge commit clásico. Solo si querés aceptar el riesgo.    |
+
+`--ff-only` es la opción segura para scripts: si el repo diverge o tenés
+commits ahead sin pushear, el pull aborta ese repo y sigue con el resto.
+Ningún caso queda a medio merge silencioso.
+
+### Ejemplo de sesión
+
+```text
+$ git-verify --pull --only-pending
+
+git-verify  7 repos · 2 con cambios pendientes
+fetch activado · 4 jobs en paralelo
+
+▶ GitHub (7 repos · 2 con cambios)
+------------------------------------------------------------
+  ! carta-qr  1 behind
+  ! tuAmigoFI-viejo  34 unstaged · 8 untracked · 98 behind
+
+Repos disponibles para pull:
+------------------------------------------------------------
+  [1] carta-qr | 1 behind
+
+Seleccioná (ej: 1,3  o  1-3  o  all  o  q para salir): 1
+
+Voy a hacer `git pull --ff-only` en 1 repos:
+  • carta-qr
+
+¿Continuar? [y/N] y
+
+Ejecutando pull...
+------------------------------------------------------------
+  ✓ carta-qr                        OK · 17 files changed, 350 insertions(+), 172 deletions(-)
+
+pull: 1 ok · 0 fallaron
+```
+
+Con `--rebase` y un repo conflictivo:
+
+```text
+Voy a hacer `git pull --rebase` en 1 repos:
+  • kioscoGustavo
+
+¿Continuar? [y/N] y
+
+Ejecutando pull...
+------------------------------------------------------------
+  ✗ kioscoGustavo  CONFLICT: no se puede aplicar porque...
+
+pull: 0 ok · 1 fallaron
+Repos fallidos (paths):
+  • /home/lucas/Documentos/Workspace/NextJs/kioscoGustavo
+```
+
+### Limitaciones conocidas de `--pull`
+
+- **Serial, no paralelo**. Un pull conflictivo te puede dejar el árbol a medio
+  merge; ir de a uno deja ver el problema claro. Si querés paralelizar, eso
+  es otra historia (cada repo conflictivo requiere intervención manual).
+- **No resuelve conflictos**. Si un repo falla, te avisa y sigue con los
+  demás. La resolución queda para vos.
+- **No hace stash**. Si tenés cambios locales en un repo, ese repo se
+  saltea sin tocarlos. No los pisa.
 
 ---
 

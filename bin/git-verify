@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+#
+# git-verify - Lista los repos de GitHub con cambios pendientes bajo un árbol
+# de directorios. Detecta uncommitted changes, untracked files, unpushed
+# commits y commits pendientes de pull. Read-only por default.
+#
+# Es un wrapper sobre mgitstatus:
+#   https://github.com/fboender/multi-git-status
+#
+# Filtramos los repos cuyo remoto apunte a github.com (case-insensitive) y
+# le pasamos solo esos a mgitstatus, que hace el chequeo fino por repo.
+
+set -euo pipefail
+
+# -------- Defaults --------
+SCAN_DIR="$HOME"
+DEPTH=2
+DO_FETCH=0
+EXCLUDE_OK=1   # default: solo repos con cambios pendientes
+
+# -------- Helpers --------
+usage() {
+  cat <<'EOF'
+git-verify - Lista repos de GitHub con cambios pendientes
+
+Uso:
+  git-verify [OPCIONES] [DIRECTORIO]
+
+Argumentos:
+  DIRECTORIO         Raíz a escanear. Default: $HOME
+
+Opciones:
+  -d, --depth N      Profundidad máxima de búsqueda (default: 2; 0 = sin límite).
+                     Nota: cuenta el directorio de partida. -d 2 encuentra
+                     repos hasta 'raiz/<algo>/.git'.
+      --fetch         Hace 'git fetch --quiet' antes de chequear, para que
+                      "needs pull" sea preciso. Toca cada remote.
+      --all           Muestra también los repos OK (sin cambios pendientes).
+  -h, --help         Esta ayuda.
+
+Dependencias:
+  bash, git, find y mgitstatus (https://github.com/fboender/multi-git-status)
+
+Ejemplos:
+  git-verify                              # escanea $HOME, depth 2, sin fetch
+  git-verify --fetch                     # igual pero con fetch previo
+  git-verify ~/proyectos                  # otra raíz
+  git-verify -d 4 --fetch ~/code          # profundidad 4 + fetch
+  git-verify -d 0 ~/proyectos             # sin límite de profundidad
+EOF
+}
+
+err() { echo "Error: $*" >&2; }
+
+# Devuelve 0 (verdadero) si algún remote del repo apunta a github.com.
+is_github_repo() {
+  local repo="$1"
+  local remote url
+  while IFS= read -r remote; do
+    [[ -z "$remote" ]] && continue
+    url="$(git -C "$repo" config --get "remote.$remote.url" 2>/dev/null || true)"
+    if [[ -n "$url" ]] && echo "$url" | grep -qi "github.com"; then
+      return 0
+    fi
+  done < <(git -C "$repo" remote 2>/dev/null)
+  return 1
+}
+
+# -------- Parseo de argumentos --------
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)        usage; exit 0 ;;
+    -d|--depth)       [[ $# -ge 2 ]] || { err "falta valor para $1"; exit 2; }
+                      DEPTH="$2"; shift 2 ;;
+    --depth=*)        DEPTH="${1#*=}"; shift ;;
+    --fetch)          DO_FETCH=1; shift ;;
+    --all)            EXCLUDE_OK=0; shift ;;
+    --)               shift; while [[ $# -gt 0 ]]; do ARGS+=("$1"); shift; done ;;
+    -*)               err "opción desconocida: $1"; usage; exit 2 ;;
+    *)                ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#ARGS[@]} -gt 0 ]]; then
+  SCAN_DIR="${ARGS[0]}"
+fi
+
+# -------- Validaciones --------
+if [[ ! -d "$SCAN_DIR" ]]; then
+  err "'$SCAN_DIR' no existe o no es un directorio."
+  exit 2
+fi
+
+if ! command -v mgitstatus >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+mgitstatus no está instalado.
+
+Es la dependencia que hace el chequeo fino por repo. Para instalarlo:
+
+  git clone https://github.com/fboender/multi-git-status.git
+  cd multi-git-status
+  make install                              # global (requiere sudo)
+  # o, sin sudo, solo para tu usuario:
+  PREFIX=~/.local make install
+
+Más info: https://github.com/fboender/multi-git-status
+EOF
+  exit 127
+fi
+
+# -------- Descubrir repos --------
+# find con -name .git + prune: solo entra a .git (no a sus subdirs).
+# Silenciamos errores de permisos con 2>/dev/null.
+# find -maxdepth cuenta desde el directorio pasado: -maxdepth 2 matchea
+# raiz/.git, raiz/<algo>, raiz/<algo>/.git. Para "sin límite" no pasamos
+# -maxdepth (DEPTH=0); para valores >0 lo usamos como techo.
+if [[ "$DEPTH" -eq 0 ]]; then
+  FIND_ARGS=()
+else
+  FIND_ARGS=(-maxdepth "$DEPTH")
+fi
+
+mapfile -t ALL_REPOS < <(
+  find "$SCAN_DIR" "${FIND_ARGS[@]}" -name .git -type d -prune -print 2>/dev/null \
+    | sed 's|/\.git$||' | sort -u
+)
+
+if [[ ${#ALL_REPOS[@]} -eq 0 ]]; then
+  echo "No se encontraron repositorios git en '$SCAN_DIR' (depth=$DEPTH)."
+  exit 0
+fi
+
+# -------- Filtrar por GitHub --------
+GH_REPOS=()
+NON_GH=0
+for repo in "${ALL_REPOS[@]}"; do
+  if is_github_repo "$repo"; then
+    GH_REPOS+=("$repo")
+  else
+    NON_GH=$((NON_GH + 1))
+  fi
+done
+
+if [[ ${#GH_REPOS[@]} -eq 0 ]]; then
+  echo "Repos git encontrados: ${#ALL_REPOS[@]} en '$SCAN_DIR' (depth=$DEPTH)."
+  echo "Ninguno apunta a github.com (¿están bien configurados los remotes?)."
+  exit 0
+fi
+
+# -------- Header --------
+echo "Escaneados: ${#ALL_REPOS[@]} | GitHub: ${#GH_REPOS[@]} | Otros: $NON_GH"
+echo "Directorio: $SCAN_DIR (depth=$DEPTH)"
+if [[ "$DO_FETCH" -eq 1 ]]; then
+  echo "Fetch: activado (puede ser lento si hay muchos remotes)"
+fi
+echo "----------------------------------------"
+
+# -------- Fetch opcional --------
+if [[ "$DO_FETCH" -eq 1 ]]; then
+  for repo in "${GH_REPOS[@]}"; do
+    # Toleramos errores individuales (sin red, sin credenciales, etc.)
+    git -C "$repo" fetch --quiet 2>/dev/null || true
+  done
+fi
+
+# -------- Pasamanos a mgitstatus --------
+MGIT_ARGS=()
+[[ "$EXCLUDE_OK" -eq 1 ]] && MGIT_ARGS+=(-e)
+# Nota: si DO_FETCH=1 ya hicimos fetch nosotros, así que NO pasamos -f a
+# mgitstatus (evita doble pasada por cada remote).
+
+# Sin flag paralelo confiable: simplemente invocamos.
+# exec para que el exit code de mgitstatus sea el de git-verify (útil en CI/scripts).
+exec mgitstatus "${MGIT_ARGS[@]}" "${GH_REPOS[@]}"

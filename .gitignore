@@ -1,0 +1,6 @@
+# Local Pi runtime state
+.atl/
+
+# Build artifacts / temp
+*.swp
+.DS_Store
